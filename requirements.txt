@@ -1,0 +1,27 @@
+# ZisMed Chatbot with Gemini API - Independent Setup
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-dotenv==1.0.0
+pydantic==2.5.0
+httpx==0.25.2
+
+
+# Database connections
+motor==3.3.2  # MongoDB async driver
+pymongo==4.6.0  # MongoDB sync driver
+pyodbc==5.0.1  # SQL Server connection
+
+# Authentication & Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6
+
+# CORS and middleware
+fastapi-cors==0.0.6
+
+# Date/time handling
+python-dateutil==2.8.2
+
+# Optional: For enhanced features
+requests==2.31.0
+aiofiles==23.2.1

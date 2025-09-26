@@ -1,0 +1,67 @@
+# Variables de entorno - NUNCA subir credenciales
+.env
+.env.local
+.env.production
+.env.development
+
+# Dependencias
+venv/
+env/
+venv_clean/
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs y archivos temporales
+*.log
+server_logs.txt
+*.tmp
+
+# Archivos de prueba (contienen tokens/credenciales)
+test_*.json
+test_*.py
+
+# Base de datos local
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE y editores
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sistema operativo
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Backups y archivos temporales
+*.tar.gz
+*.zip
+ZisBot_Backup_*/
+ZisBot_COMPLETO_*/
+ARCHIVOS_A_ELIMINAR_*/
+obsoletos_para_borrar/
+
+# Archivos de debugging específicos del proyecto
+debug_*.py
+investigar_*.py
+verificar_*.py
+db_inspect_*.py
+clear_cache_redis.py
+limpiar_cache_y_arreglar.py
+nul
+
+# Distribución
+build/
+dist/
+*.egg-info/

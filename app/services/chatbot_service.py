@@ -1,0 +1,1419 @@
+"""
+Servicio de Chatbot Principal
+Integra LangChain + LangGraph + Memoria Redis + Datos Reales del Hospital
+"""
+
+import json
+import re
+import redis
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+
+from app.integrations.working_langgraph_agent import working_langgraph_agent
+from app.services.orm_hospital_service import orm_hospital_service
+from app.services.hospital_data_service import hospital_data_service
+# from app.services.memory_service import hybrid_memory, ChatMessage
+
+logger = logging.getLogger(__name__)
+
+class ChatbotService:
+    """
+    Servicio principal de chatbot que combina:
+    - LangChain + LangGraph para procesamiento inteligente
+    - Redis para memoria persistente de conversaciones
+    - Detección avanzada de consultas médicas específicas
+    - Acceso directo a datos reales del hospital
+    """
+
+    def __init__(self, groq_api_key: str, redis_url: str = "redis://localhost:6379"):
+        # LangChain/LangGraph setup
+        self.groq_api_key = groq_api_key
+        self.llm = ChatGroq(
+            groq_api_key=groq_api_key,
+            model_name="llama-3.1-8b-instant",
+            temperature=0.3,
+            max_tokens=2048
+        )
+        self.workflow = working_langgraph_agent
+
+        # Redis setup for persistent memory
+        try:
+            self.redis = redis.from_url(redis_url, decode_responses=True)
+            self.redis.ping()
+            logger.info("✅ Redis conectado para memoria persistente")
+        except Exception as e:
+            logger.warning(f"⚠️ Redis no disponible: {e}")
+            self.redis = None
+            self._memory_fallback = {}
+
+        # Memory settings
+        self.max_memory_messages = 10
+
+        logger.info("🚀 ChatbotService inicializado correctamente")
+
+    def _get_conversation_key(self, conversation_id: str) -> str:
+        """Generar clave Redis para conversación"""
+        return f"chatbot:conversation:{conversation_id}"
+
+    def _get_conversation_history(self, conversation_id: str) -> List[Dict]:
+        """Obtener historial desde Redis tradicional"""
+        if self.redis:
+            try:
+                key = self._get_conversation_key(conversation_id)
+                history_json = self.redis.get(key)
+                if history_json:
+                    return json.loads(history_json)
+                return []
+            except Exception as redis_error:
+                logger.error(f"Error Redis: {redis_error}")
+                return []
+        else:
+            return self._memory_fallback.get(conversation_id, [])
+
+    def _save_conversation_history(self, conversation_id: str, history: List[Dict]):
+        """Guardar historial en Redis o fallback"""
+        if self.redis:
+            try:
+                key = self._get_conversation_key(conversation_id)
+                # Guardar con expiración de 7 días
+                self.redis.setex(key, timedelta(days=7), json.dumps(history))
+            except Exception as e:
+                logger.error(f"Error guardando en Redis: {e}")
+                self._memory_fallback[conversation_id] = history
+        else:
+            self._memory_fallback[conversation_id] = history
+
+    async def process_message(
+        self,
+        user_message: str,
+        conversation_id: str,
+        user_id: str,
+        hospital_id: str,
+        user_name: str = None
+    ) -> str:
+        """
+        Procesar mensaje del usuario usando el sistema completo
+        """
+        try:
+            # 1. OBTENER HISTORIAL DE CONVERSACIÓN
+            history = self._get_conversation_history(conversation_id)
+            display_name = user_name or "Usuario"
+            first_name = display_name.split()[0] if display_name != "Usuario" else "Usuario"
+
+            logger.info(f"📨 Procesando: {user_message[:50]}... | Usuario: {first_name}")
+
+            # 2. ANALIZAR TIPO DE CONSULTA MÉDICA
+            try:
+                query_info = await self._analyze_medical_query(user_message)
+                logger.info(f"🔍 ANÁLISIS: {query_info}")
+            except Exception as analysis_error:
+                logger.error(f"ERROR EN ANÁLISIS: {analysis_error}")
+                return f"ERROR EN ANÁLISIS: {str(analysis_error)}"
+
+            real_data = None
+            use_real_data = False
+
+            # 3. SI ES CONSULTA MÉDICA ESPECÍFICA, OBTENER DATOS REALES
+            if query_info['type'] != 'general':
+                logger.info(f"🏥 Obteniendo datos reales para: {query_info['type']}")
+                # Determinar rol del usuario (por defecto directivo para Fase 1)
+                user_role = 'directivo'  # En Fase 1 todos los usuarios son directivos
+                real_data = await self._get_real_hospital_data(query_info, user_id, user_role)
+
+                if real_data:
+                    logger.info(f"✅ Datos reales obtenidos exitosamente")
+                    use_real_data = True
+                else:
+                    logger.warning("❌ No se pudieron obtener datos reales")
+
+            # 4. GENERAR RESPUESTA
+            if use_real_data and real_data:
+                # Usar datos reales para respuesta directa y precisa
+                response = await self._generate_response_with_real_data(
+                    user_message, query_info, real_data, first_name
+                )
+                confidence = 0.95
+                intent = query_info['type']
+
+            elif query_info['type'] in ['busqueda_paciente_nombre', 'busqueda_paciente_dni', 'historia_clinica', 'historia_clinica_dni', 'volumen_pacientes', 'turnos_programados', 'horarios_atencion']:
+                # Respuesta rápida para búsquedas de paciente no encontradas
+                response = await self._generate_patient_not_found_response(query_info, first_name)
+                confidence = 0.90
+                intent = f"{query_info['type']}_not_found"
+
+            else:
+                # Usar LangGraph para consultas generales
+                try:
+                    logger.info("🤖 Ejecutando workflow LangGraph")
+                    conversation_context = self._format_context_for_langgraph(
+                        history, hospital_id, user_message
+                    )
+
+                    result = await self.workflow.process(
+                        message=user_message,
+                        hospital_id=hospital_id,
+                        conversation_history=conversation_context
+                    )
+
+                    if result and result.get('intent') != 'error':
+                        response = result['response']
+                        confidence = result.get('confidence', 0.8)
+                        intent = result.get('intent', 'langgraph_success')
+                    else:
+                        # Fallback inteligente
+                        response, confidence, intent = await self._intelligent_fallback(
+                            user_message, hospital_id, first_name
+                        )
+
+                except Exception as workflow_error:
+                    logger.warning(f"❌ Error en workflow: {workflow_error}")
+                    import traceback
+                    traceback.print_exc()
+                    # MOSTRAR ERROR ESPECÍFICO PARA DEBUG
+                    response = f"ERROR EN WORKFLOW: {str(workflow_error)}"
+                    confidence = 0.0
+                    intent = "error"
+
+            # 5. GUARDAR EN MEMORIA
+            self._save_to_memory(
+                conversation_id, user_message, response, intent, confidence, hospital_id
+            )
+
+            logger.info(f"✅ Respuesta generada - Intent: {intent}, Confianza: {confidence}")
+            return response
+
+        except Exception as e:
+            logger.error(f"❌ Error procesando mensaje: {e}")
+            import traceback
+            traceback.print_exc()
+            error_response = f"ERROR DETALLADO: {str(e)}"
+
+            # Guardar error en memoria
+            try:
+                self._save_to_memory(
+                    conversation_id, user_message, error_response, "error", 0.0, hospital_id
+                )
+            except:
+                pass
+
+            return error_response
+
+    async def _analyze_medical_query(self, message: str) -> Dict:
+        """
+        Analizar mensaje para detectar consultas médicas específicas
+        """
+        message_lower = message.lower()
+        logger.info(f"🔍 ANALIZANDO: '{message}' -> '{message_lower}'")
+
+        # 1. HISTORIA CLÍNICA CON DNI (PRIORIDAD MÁXIMA)
+        if (any(word in message_lower for word in ['historia', 'historial', 'clinica', 'expediente'])
+            and any(char.isdigit() for char in message)):
+
+            dni = self._extract_dni(message)
+            if dni:
+                logger.info(f"🏥 DETECTADO: historia_clinica_dni, DNI: {dni}")
+                return {
+                    'type': 'historia_clinica_dni',
+                    'documento': dni,
+                    'nombre': None
+                }
+
+        # 2. HISTORIA CLÍNICA POR NOMBRE (sin DNI)
+        if any(word in message_lower for word in ['historia', 'historial', 'clinica', 'expediente']):
+            paciente_info = self._extract_patient_info(message)
+            if paciente_info.get('nombre') and not paciente_info.get('documento'):
+                logger.info(f"🏥 DETECTADO: historia_clinica, paciente: {paciente_info}")
+                return {
+                    'type': 'historia_clinica',
+                    'documento': None,
+                    'nombre': paciente_info.get('nombre')
+                }
+
+        # 3. VOLUMEN DE PACIENTES POR SERVICIO/FECHAS (PRIORIDAD ALTA)
+        if any(word in message_lower for word in ['pacientes atendidos', 'volumen', 'cantidad atendidos', 'atendidos']):
+            servicio, mes, año = self._extract_service_and_date(message_lower)
+            logger.info(f"📊 DETECTADO: volumen_pacientes, servicio: {servicio}, mes: {mes}, año: {año}")
+            return {
+                'type': 'volumen_pacientes',
+                'servicio': servicio,
+                'mes': mes,
+                'año': año
+            }
+
+        # 4. TURNOS PROGRAMADOS
+        if any(word in message_lower for word in ['turnos', 'agenda', 'programados']):
+            servicio = self._extract_service_name(message_lower)
+            logger.info(f"📅 DETECTADO: turnos_programados, servicio: {servicio}")
+            return {
+                'type': 'turnos_programados',
+                'servicio': servicio
+            }
+
+        # 5. HORARIOS DE ATENCIÓN
+        if any(word in message_lower for word in ['horarios', 'atencion', 'horario']):
+            servicio = self._extract_service_name(message_lower)
+            logger.info(f"🕒 DETECTADO: horarios_atencion, servicio: {servicio}")
+            return {
+                'type': 'horarios_atencion',
+                'servicio': servicio
+            }
+
+        # 5.5 ESPECIALIDADES - PRIORIDAD ALTA (antes que camas)
+        if any(word in message_lower for word in ['especialidad', 'especialidades', 'especialista', 'especialistas']):
+            logger.info(f"🏥 DETECTADO: especialidades_disponibles")
+            return {
+                'type': 'especialidades_disponibles'
+            }
+
+        # 6. CAMAS DISPONIBLES (con filtros de fecha y sector) - EVITAR CONFLICTO
+        if any(word in message_lower for word in ['cama', 'camas', 'libre', 'ocupad']) or (
+            'disponible' in message_lower and not any(esp in message_lower for esp in ['especialidad', 'especialidades'])
+        ):
+            servicio = self._extract_service_name(message_lower)
+            fecha = self._extract_date_from_message(message_lower)
+            logger.info(f"🛏️ DETECTADO: camas_disponibles, servicio: {servicio}, fecha: {fecha}")
+            return {
+                'type': 'camas_disponibles',
+                'servicio': servicio,
+                'fecha': fecha
+            }
+
+        # 7. BÚSQUEDA DE PACIENTE POR DNI
+        if (any(word in message_lower for word in ['dni', 'documento', 'buscar paciente'])
+            and any(char.isdigit() for char in message)):
+
+            dni = self._extract_dni(message)
+            logger.info(f"🔍 DETECTADO: busqueda_paciente_dni, DNI: {dni}")
+            return {
+                'type': 'busqueda_paciente_dni',
+                'documento': dni
+            }
+
+        # 8. BÚSQUEDA DE PACIENTE POR NOMBRE
+        if any(word in message_lower for word in ['buscar', 'busca', 'datos del paciente', 'paciente']):
+            paciente_info = self._extract_patient_info(message)
+            if paciente_info.get('nombre'):
+                logger.info(f"👤 DETECTADO: busqueda_paciente_nombre, paciente: {paciente_info}")
+                return {
+                    'type': 'busqueda_paciente_nombre',
+                    'nombre': paciente_info.get('nombre')
+                }
+
+        # 8. CONSULTA GENERAL
+        logger.info(f"❓ DETECTADO: consulta_general")
+        return {'type': 'general'}
+
+    def _extract_patient_info(self, message: str) -> Dict:
+        """Extraer información del paciente del mensaje"""
+        logger.info(f"🔍 EXTRAYENDO INFO PACIENTE: '{message}'")
+
+        # Extraer DNI
+        dni_match = re.search(r'\b(\d{7,8})\b', message)
+        documento = dni_match.group(1) if dni_match else None
+        logger.info(f"🆔 DNI: {documento}")
+
+        # Extraer nombre con patrones mejorados
+        name_patterns = [
+            # Patrón 1: "con nombre [NOMBRE]", "llamado [NOMBRE]"
+            r'(?:con\s+nombre|llamad[oa])\s+([A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+(?:\s+[A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+)*)',
+            # Patrón 2: "nombre [NOMBRE]" directo
+            r'nombre\s+([A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+(?:\s+[A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+)*)',
+            # Patrón 3: "siguiente paciente/nombre: [NOMBRE]"
+            r'siguiente\s+(?:paciente|nombre)[\s:]+([A-ZÁÉÍÓÚñÑa-záéíóúñÑ\s]+)',
+            # Patrón 4: Nombres todo en mayúsculas (formato hospital)
+            r'\b([A-ZÁÉÍÓÚÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ]{2,})+)\b',
+            # Patrón 5: Formato título tradicional
+            r'(?:historia|historial|clinica|expediente).*?(?:de|del|para)\s+([A-ZÁÉÍÓÚñÑ][a-záéíóúñÑ]+\s+[A-ZÁÉÍÓÚñÑ][a-záéíóúñÑ]+)',
+        ]
+
+        nombre = None
+        for i, pattern in enumerate(name_patterns):
+            name_match = re.search(pattern, message, re.IGNORECASE)
+            if name_match:
+                nombre = name_match.group(1).strip()
+                nombre = ' '.join(word.capitalize() for word in nombre.split())
+                logger.info(f"👤 NOMBRE encontrado con patrón {i}: '{nombre}'")
+                break
+
+        if not nombre:
+            logger.info(f"❌ NO se encontró nombre")
+
+        return {'documento': documento, 'nombre': nombre}
+
+    def _extract_dni(self, message: str) -> str:
+        """Extraer DNI del mensaje"""
+        dni_patterns = [
+            r'dni[:\s]*(\d{7,8})',
+            r'documento[:\s]*(\d{7,8})',
+            r'paciente[,\s]*dni[:\s]*(\d{7,8})',
+            r'\b(\d{7,8})\b',
+        ]
+
+        for pattern in dni_patterns:
+            dni_match = re.search(pattern, message, re.IGNORECASE)
+            if dni_match:
+                return dni_match.group(1) if dni_match.groups() else dni_match.group()
+        return None
+
+    def _extract_service_name(self, message_lower: str) -> str:
+        """Extraer nombre de servicio médico"""
+        service_patterns = {
+            'uci': ['uci', 'terapia intensiva', 'cuidados intensivos'],
+            'internacion': ['internacion', 'internación', 'sala común'],
+            'emergencias': ['emergencia', 'guardia', 'urgencia'],
+            'pediatria': ['pediatria', 'pediatría', 'niños']
+        }
+
+        for service, patterns in service_patterns.items():
+            if any(pattern in message_lower for pattern in patterns):
+                return service
+
+        # Servicios adicionales para consultas específicas
+        servicios_adicionales = {
+            'cardiologia': ['cardiologia', 'cardiología', 'corazón'],
+            'traumatologia': ['traumatologia', 'traumatología', 'trauma'],
+            'neurologia': ['neurologia', 'neurología'],
+            'ginecologia': ['ginecologia', 'ginecología'],
+            'medicina_general': ['medicina general', 'clinica medica'],
+            'cirugia': ['cirugia', 'cirugía']
+        }
+
+        for service, patterns in servicios_adicionales.items():
+            if any(pattern in message_lower for pattern in patterns):
+                return service
+
+        return None
+
+    def _extract_service_and_date(self, message_lower: str) -> tuple:
+        """Extraer nombre de servicio y fecha del mensaje"""
+        import re
+        from datetime import datetime
+
+        # Extraer servicio
+        servicio = self._extract_service_name(message_lower)
+
+        # Extraer mes y año
+        meses = {
+            'enero': 1, 'febrero': 2, 'marzo': 3, 'abril': 4, 'mayo': 5, 'junio': 6,
+            'julio': 7, 'agosto': 8, 'septiembre': 9, 'octubre': 10, 'noviembre': 11, 'diciembre': 12
+        }
+
+        mes = None
+        año = None
+
+        # Buscar mes por nombre
+        for nombre_mes, num_mes in meses.items():
+            if nombre_mes in message_lower:
+                mes = num_mes
+                break
+
+        # Buscar mes por número
+        if not mes:
+            mes_match = re.search(r'mes (\d{1,2})', message_lower)
+            if mes_match:
+                mes = int(mes_match.group(1))
+
+        # Buscar año
+        año_match = re.search(r'(\d{4})', message_lower)
+        if año_match:
+            año = int(año_match.group(1))
+        else:
+            año = datetime.now().year  # Año actual por defecto
+
+        return servicio, mes, año
+
+    def _extract_date_from_message(self, message_lower: str) -> str:
+        """Extraer fecha del mensaje en formato YYYY-MM-DD"""
+        import re
+        from datetime import datetime, date
+
+        # Patrones de fecha comunes
+        date_patterns = [
+            r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})',  # DD/MM/YYYY o DD-MM-YYYY
+            r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})',  # YYYY/MM/DD o YYYY-MM-DD
+            r'(\d{1,2})\s+de\s+(\w+)\s+de\s+(\d{4})',  # DD de MMMM de YYYY
+            r'hoy|hoje',  # Hoy
+            r'mañana|amanhã',  # Mañana
+            r'ayer|ontem'  # Ayer
+        ]
+
+        meses_esp = {
+            'enero': 1, 'febrero': 2, 'marzo': 3, 'abril': 4, 'mayo': 5, 'junio': 6,
+            'julio': 7, 'agosto': 8, 'septiembre': 9, 'octubre': 10, 'noviembre': 11, 'diciembre': 12
+        }
+
+        # Buscar fechas específicas
+        for pattern in date_patterns:
+            match = re.search(pattern, message_lower)
+            if match:
+                if pattern == r'hoy|hoje':
+                    return date.today().strftime('%Y-%m-%d')
+                elif pattern == r'mañana|amanhã':
+                    return (date.today() + timedelta(days=1)).strftime('%Y-%m-%d')
+                elif pattern == r'ayer|ontem':
+                    return (date.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+                elif 'de' in pattern and len(match.groups()) == 3:
+                    # Formato DD de MMMM de YYYY
+                    dia, mes_nombre, año = match.groups()
+                    mes_num = meses_esp.get(mes_nombre.lower())
+                    if mes_num:
+                        try:
+                            fecha = date(int(año), mes_num, int(dia))
+                            return fecha.strftime('%Y-%m-%d')
+                        except ValueError:
+                            pass
+                elif len(match.groups()) == 3:
+                    # Otros formatos numéricos
+                    g1, g2, g3 = match.groups()
+                    try:
+                        # Intentar DD/MM/YYYY
+                        if len(g3) == 4:  # YYYY está al final
+                            fecha = date(int(g3), int(g2), int(g1))
+                        else:  # YYYY está al principio
+                            fecha = date(int(g1), int(g2), int(g3))
+                        return fecha.strftime('%Y-%m-%d')
+                    except ValueError:
+                        continue
+
+        return None
+
+    def _validate_user_permissions(self, user_id: str, user_role: str, patient_dni: str = None) -> Dict[str, bool]:
+        """
+        Validar permisos de usuario para acceso a datos de pacientes
+
+        Args:
+            user_id: ID del usuario que consulta
+            user_role: Rol del usuario (directivo, medico, enfermero, etc.)
+            patient_dni: DNI del paciente consultado
+
+        Returns:
+            Dict con permisos: {
+                'can_view_basic_data': bool,
+                'can_view_clinical_history': bool,
+                'can_view_detailed_evolution': bool,
+                'can_view_medications': bool
+            }
+        """
+        # Configuración de permisos por rol
+        role_permissions = {
+            'directivo': {
+                'can_view_basic_data': True,
+                'can_view_clinical_history': True,
+                'can_view_detailed_evolution': True,
+                'can_view_medications': True
+            },
+            'director': {
+                'can_view_basic_data': True,
+                'can_view_clinical_history': True,
+                'can_view_detailed_evolution': True,
+                'can_view_medications': True
+            },
+            'medico': {
+                'can_view_basic_data': True,
+                'can_view_clinical_history': True,
+                'can_view_detailed_evolution': True,
+                'can_view_medications': True
+            },
+            'jefe_servicio': {
+                'can_view_basic_data': True,
+                'can_view_clinical_history': True,
+                'can_view_detailed_evolution': True,
+                'can_view_medications': True
+            },
+            'enfermero': {
+                'can_view_basic_data': True,
+                'can_view_clinical_history': False,
+                'can_view_detailed_evolution': False,
+                'can_view_medications': True
+            },
+            'administrativo': {
+                'can_view_basic_data': True,
+                'can_view_clinical_history': False,
+                'can_view_detailed_evolution': False,
+                'can_view_medications': False
+            }
+        }
+
+        # Por defecto, rol directivo para usuarios del sistema de informes
+        if not user_role or user_role in ['informe_system', 'sistema_informe']:
+            user_role = 'directivo'
+
+        return role_permissions.get(user_role.lower(), {
+            'can_view_basic_data': True,
+            'can_view_clinical_history': False,
+            'can_view_detailed_evolution': False,
+            'can_view_medications': False
+        })
+
+    async def _get_real_hospital_data(self, query_info: Dict, user_id: str = None, user_role: str = 'directivo') -> Optional[Dict]:
+        """Obtener datos reales del hospital según tipo de consulta"""
+        try:
+            query_type = query_info['type']
+
+            if query_type == 'historia_clinica':
+                # Validar permisos antes de obtener historia clínica
+                dni_paciente = query_info.get('documento')
+                permissions = self._validate_user_permissions(user_id, user_role, dni_paciente)
+
+                if not permissions['can_view_clinical_history']:
+                    logger.warning(f"❌ Usuario {user_id} sin permisos para historia clínica")
+                    return {
+                        'type': 'access_denied',
+                        'message': f"No tienes autorización para acceder a la historia clínica de este paciente.",
+                        'contact_info': "Contacta al administrador del sistema para solicitar acceso."
+                    }
+
+                # Usar hospital_data_service para historia clínica
+                result = await hospital_data_service.get_historia_clinica(
+                    documento=query_info.get('documento'),
+                    nombre=query_info.get('nombre')
+                )
+
+                if result:
+                    result['user_permissions'] = permissions
+                    logger.info(f"📋 Historia clínica autorizada para usuario: {user_id}")
+
+                return result
+
+            elif query_type == 'historia_clinica_dni':
+                # Validar permisos antes de obtener historia clínica por DNI
+                dni = query_info.get('documento')
+                permissions = self._validate_user_permissions(user_id, user_role, dni)
+
+                if not permissions['can_view_clinical_history']:
+                    logger.warning(f"❌ Usuario {user_id} sin permisos para historia clínica DNI: {dni}")
+                    return {
+                        'type': 'access_denied',
+                        'message': f"No tienes autorización para acceder a la historia clínica del paciente con DNI {dni}.",
+                        'contact_info': "Contacta al administrador del sistema para solicitar acceso."
+                    }
+
+                if dni:
+                    result = await orm_hospital_service.buscar_paciente_por_dni(dni, 3)
+                    if result.success:
+                        logger.info(f"📋 Historia clínica autorizada por DNI: {dni} para usuario: {user_id}")
+                        return {
+                            'type': 'historia_clinica_found',
+                            'patient': result.data,
+                            'dni': dni,
+                            'user_permissions': permissions
+                        }
+                return None
+
+            elif query_type == 'busqueda_paciente_dni':
+                # Usar ORM service para búsqueda por DNI
+                dni = query_info.get('documento')
+                if dni:
+                    result = await orm_hospital_service.buscar_paciente_por_dni(dni, 3)
+                    if result.success:
+                        logger.info(f"👤 Paciente encontrado por DNI: {dni}")
+                        return {
+                            'type': 'patient_found',
+                            'patient': result.data
+                        }
+                return None
+
+            elif query_type == 'busqueda_paciente_nombre':
+                # Usar hospital_data_service para búsqueda por nombre
+                nombre = query_info.get('nombre')
+                if nombre:
+                    result = await hospital_data_service.buscar_paciente_por_nombre(nombre)
+                    if result:
+                        logger.info(f"👤 Paciente encontrado por nombre: {nombre}")
+                        return {
+                            'type': 'patient_found_by_name',
+                            'patient': result,
+                            'nombre': nombre
+                        }
+                return None
+
+            elif query_type == 'camas_disponibles':
+                # Usar hospital_data_service para camas con filtros
+                result = await hospital_data_service.get_camas_disponibles(
+                    servicio_nombre=query_info.get('servicio'),
+                    fecha=query_info.get('fecha')
+                )
+                logger.info(f"🛏️ Camas disponibles resultado: {result is not None}")
+                return result
+
+            elif query_type == 'volumen_pacientes':
+                # Usar hospital_data_service para volumen de pacientes
+                servicio = query_info.get('servicio', 'medicina_general')
+                mes = query_info.get('mes', datetime.now().month)
+                año = query_info.get('año', datetime.now().year)
+                result = await hospital_data_service.get_volumen_pacientes(servicio, mes, año)
+                logger.info(f"📊 Volumen pacientes resultado: {result is not None}")
+                return result
+
+            elif query_type == 'turnos_programados':
+                # Usar hospital_data_service para turnos programados
+                servicio = query_info.get('servicio', 'medicina_general')
+                result = await hospital_data_service.get_turnos_programados(servicio)
+                logger.info(f"📅 Turnos programados resultado: {result is not None}")
+                return result
+
+            elif query_type == 'horarios_atencion':
+                # Usar hospital_data_service para horarios de atención
+                servicio = query_info.get('servicio', 'medicina_general')
+                result = await hospital_data_service.get_horarios_atencion(servicio)
+                logger.info(f"🕒 Horarios atención resultado: {result is not None}")
+                return result
+
+        except Exception as e:
+            logger.error(f"❌ Error obteniendo datos reales: {e}")
+
+        return None
+
+    async def _generate_response_with_real_data(
+        self,
+        user_message: str,
+        query_info: Dict,
+        real_data: Dict,
+        first_name: str
+    ) -> str:
+        """Generar respuesta usando datos reales del hospital"""
+
+        query_type = query_info['type']
+
+        if query_type == 'historia_clinica':
+            return await self._format_historia_clinica_response(
+                user_message, query_info, real_data, first_name
+            )
+        elif query_type == 'historia_clinica_dni':
+            return await self._format_historia_clinica_dni_response(
+                user_message, query_info, real_data, first_name
+            )
+        elif query_type == 'busqueda_paciente_dni':
+            return await self._format_patient_search_response(
+                user_message, query_info, real_data, first_name
+            )
+        elif query_type == 'busqueda_paciente_nombre':
+            return await self._format_patient_search_by_name_response(
+                user_message, query_info, real_data, first_name
+            )
+        elif query_type == 'camas_disponibles':
+            return await self._format_beds_response(
+                user_message, query_info, real_data, first_name
+            )
+        elif query_type == 'volumen_pacientes':
+            return await self._format_volume_response(
+                user_message, query_info, real_data, first_name
+            )
+        elif query_type == 'turnos_programados':
+            return await self._format_turnos_response(
+                user_message, query_info, real_data, first_name
+            )
+        elif query_type == 'horarios_atencion':
+            return await self._format_horarios_response(
+                user_message, query_info, real_data, first_name
+            )
+
+        return f"Hola {first_name}, encontré información pero necesito más detalles para ayudarte mejor."
+
+    async def _generate_patient_not_found_response(self, query_info: Dict, first_name: str) -> str:
+        """Generar respuesta rápida cuando no se encuentra el paciente"""
+
+        query_type = query_info['type']
+
+        if query_type in ['busqueda_paciente_nombre', 'historia_clinica']:
+            nombre = query_info.get('nombre', 'el nombre solicitado')
+            return f"""🔍 **BÚSQUEDA DE PACIENTE POR NOMBRE**
+
+❌ No se encontró paciente con el nombre "{nombre}" en nuestro sistema.
+
+**Sugerencias:**
+• Verificar la ortografía del nombre completo
+• Probar con nombre y apellido
+• Confirmar que el paciente esté registrado
+• Contactar admisión: **4212121**
+
+**Alternativas de búsqueda:**
+• Búsqueda por DNI (más precisa)
+• Consulta en recepción del hospital
+
+¿Puedo ayudarte con otra consulta, {first_name}?"""
+
+        elif query_type in ['busqueda_paciente_dni', 'historia_clinica_dni']:
+            dni = query_info.get('documento', 'el DNI solicitado')
+            return f"""❌ **Paciente No Encontrado**
+
+🔍 **DNI consultado:** {dni}
+
+**Posibles causas:**
+• El paciente no está registrado en nuestro sistema
+• Error en el número de documento ingresado
+• Problemas temporales de conectividad
+
+**Te recomiendo:**
+• Verificar el número de DNI
+• Contactar admisión: **4212121**
+• Consultar el sistema principal de historias clínicas
+
+¿Puedo ayudarte con otra consulta, {first_name}?"""
+
+        else:
+            return f"Hola {first_name}, no pude encontrar la información solicitada. Por favor contacta al 4212121."
+
+    async def _format_historia_clinica_response(
+        self, user_message: str, query_info: Dict, real_data: Dict, first_name: str
+    ) -> str:
+        """Formatear respuesta de historia clínica con control de permisos"""
+
+        # Verificar si hay denegación de acceso
+        if real_data and real_data.get('type') == 'access_denied':
+            return f"""🚫 **ACCESO DENEGADO - HISTORIA CLÍNICA**
+
+Hola {first_name}, {real_data.get('message')}
+
+**Información:**
+• Solo personal autorizado puede acceder a historias clínicas
+• Esta acción ha sido registrada en el sistema
+• {real_data.get('contact_info')}
+
+🏥 **Hospital Regional Santiago del Estero**
+📞 **Soporte:** 4212121 - Interno 950"""
+
+        if not real_data or real_data.get('error'):
+            nombre = query_info.get('nombre', 'el paciente solicitado')
+            return f"""Hola {first_name}, no pude acceder a la historia clínica de {nombre} en este momento.
+
+**Posibles causas:**
+• El paciente no está registrado en nuestro sistema
+• Error temporal en la base de datos
+• Información de búsqueda incorrecta
+
+**Te recomiendo:**
+• Verificar los datos del paciente
+• Contactar admisión: **4212121**
+• Revisar el sistema de historias clínicas
+
+¿Necesitas ayuda con algo más?"""
+
+        # Formatear datos reales encontrados
+        patient_data = real_data.get('paciente', {})
+        internaciones = real_data.get('internaciones', [])
+
+        response = f"""🏥 **HISTORIA CLÍNICA ENCONTRADA**
+
+📋 **Datos del Paciente:**
+• **Nombre:** {patient_data.get('nombre_completo', 'No disponible')}
+• **DNI:** {patient_data.get('documento', 'No disponible')}
+• **Fecha de Nacimiento:** {patient_data.get('fecha_nacimiento', 'No disponible')}
+• **Obra Social:** {patient_data.get('obra_social', 'No especificada')}
+
+📊 **Historial de Internaciones:**"""
+
+        if internaciones:
+            for i, int_data in enumerate(internaciones[:3], 1):
+                response += f"""
+**{i}.** {int_data.get('fecha_ingreso', 'Fecha no disponible')} - {int_data.get('sector', 'Sector no especificado')}
+   • Diagnóstico: {int_data.get('diagnostico', 'No especificado')}
+   • Estado: {int_data.get('estado', 'No especificado')}"""
+        else:
+            response += "\n• Sin internaciones registradas"
+
+        response += f"""
+
+✅ **Actualizado:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
+🏥 **Hospital Regional Santiago del Estero**
+📞 **Consultas:** 4212121"""
+
+        return response
+
+    async def _format_historia_clinica_dni_response(
+        self, user_message: str, query_info: Dict, real_data: Dict, first_name: str
+    ) -> str:
+        """Formatear respuesta de historia clínica basada en DNI con control de permisos"""
+
+        # Verificar si hay denegación de acceso
+        if real_data and real_data.get('type') == 'access_denied':
+            return f"""🚫 **ACCESO DENEGADO - HISTORIA CLÍNICA**
+
+Hola {first_name}, {real_data.get('message')}
+
+**Información:**
+• Solo personal autorizado puede acceder a historias clínicas
+• Esta acción ha sido registrada en el sistema
+• {real_data.get('contact_info')}
+
+🏥 **Hospital Regional Santiago del Estero**
+📞 **Soporte:** 4212121 - Interno 950"""
+
+        if real_data and real_data.get('type') == 'historia_clinica_found':
+            patient = real_data['patient']
+            dni = real_data['dni']
+
+            # Protección para campos que pueden ser None
+            nombre = patient.get('nombre_completo', 'No disponible')
+            documento = patient.get('documento', 'No disponible')
+
+            response = f"""📋 **HISTORIA CLÍNICA - DNI {dni}**
+
+👤 **Datos del Paciente:**
+• **Nombre:** {nombre.strip() if nombre else 'No disponible'}
+• **Documento:** {documento.strip() if documento else 'No disponible'}
+• **Edad:** {patient.get('edad', 'No especificada')} años
+• **Obra Social:** {patient.get('obra_social', 'No especificada')}
+
+📞 **Contacto:**
+• **Teléfono:** {patient.get('telefono') or 'No registrado'}
+• **Email:** {patient.get('email') or 'No disponible'}"""
+
+            # Información de internación si existe
+            internacion_vigente = patient.get('internacion_vigente')
+            if internacion_vigente and internacion_vigente.get('internado'):
+                int_data = internacion_vigente
+                response += f"""
+
+🏥 **Estado Actual - INTERNADO:**
+• **Cama:** {int_data.get('cama', 'No especificada')}
+• **Habitación:** {int_data.get('habitacion', 'No especificada')}
+• **Sector:** {int_data.get('sector', 'No especificado')}
+• **Médico Responsable:** {int_data.get('medico_responsable', 'No asignado')}
+• **Fecha de Ingreso:** {int_data.get('fecha_ingreso', 'No disponible')}
+• **Días Internado:** {int_data.get('dias_internado', 'No calculado')}"""
+            else:
+                response += "\n\n🏠 **Estado:** Paciente ambulatorio (no internado)"
+
+            response += f"""
+
+📋 **Información Disponible:**
+• Historia clínica registrada en el sistema
+• Datos de contacto actualizados
+• Información de obra social vigente
+
+⚠️ **Nota:** Para acceder a detalles médicos específicos, consulte el sistema hospitalario completo.
+
+✅ **Consulta realizada:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
+🏥 **Hospital Regional Santiago del Estero**
+📞 **Mesa de Ayuda:** 4212121"""
+
+            return response
+        else:
+            dni = query_info.get('documento', 'el solicitado')
+            return f"""❌ **Historia Clínica No Encontrada**
+
+🔍 **DNI consultado:** {dni}
+
+**Posibles causas:**
+• El paciente no está registrado en nuestro sistema
+• Error en el número de documento ingresado
+• Problemas temporales de conectividad
+
+**Te recomiendo:**
+• Verificar el número de DNI
+• Contactar admisión: **4212121**
+• Consultar el sistema principal de historias clínicas
+
+¿Puedo ayudarte con otra consulta, {first_name}?"""
+
+    async def _format_patient_search_response(
+        self, user_message: str, query_info: Dict, real_data: Dict, first_name: str
+    ) -> str:
+        """Formatear respuesta de búsqueda de paciente"""
+
+        if real_data and real_data.get('type') == 'patient_found':
+            patient = real_data['patient']
+
+            # Protección para campos que pueden ser None
+            nombre = patient.get('nombre_completo', 'No disponible')
+            documento = patient.get('documento', 'No disponible')
+
+            response = f"""🏥 **PACIENTE ENCONTRADO**
+
+📋 **Información Completa:**
+• **Nombre:** {nombre.strip() if nombre else 'No disponible'}
+• **DNI:** {documento.strip() if documento else 'No disponible'}
+• **Edad:** {patient.get('edad', 'No especificada')} años
+• **Teléfono:** {patient.get('telefono') or 'No registrado'}
+• **Email:** {patient.get('email') or 'No disponible'}
+• **Obra Social:** {patient.get('obra_social', 'No especificada')}
+
+🏥 **Estado de Internación:**"""
+
+            # Información de internación (SIEMPRE mostrar para directivos)
+            internacion_vigente = patient.get('internacion_vigente')
+            if internacion_vigente and internacion_vigente.get('internado'):
+                int_data = internacion_vigente
+                response += f"""
+• **Estado:** INTERNADO
+• **Cama:** {int_data.get('cama', 'No especificada')}
+• **Habitación:** {int_data.get('habitacion', 'No especificada')}
+• **Sector:** {int_data.get('sector', 'No especificado')}
+• **Médico Responsable:** {int_data.get('medico_responsable', 'No asignado')}
+• **Fecha de Ingreso:** {int_data.get('fecha_ingreso', 'No disponible')}
+• **Días Internado:** {int_data.get('dias_internado', 'No calculado')}"""
+            else:
+                response += f"""
+• **Estado:** AMBULATORIO (no internado)
+• **Cama:** No asignada
+• **Sector:** No aplicable
+• **Médico Responsable:** Consulta externa"""
+
+            response += f"""
+
+✅ **Actualizado:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
+🏥 **Hospital Regional Santiago del Estero**"""
+
+            return response
+        else:
+            dni = query_info.get('documento', 'el solicitado')
+            return f"""🔍 **BÚSQUEDA DE PACIENTE**
+
+❌ No se encontró paciente con DNI {dni} en nuestro sistema.
+
+**Sugerencias:**
+• Verificar que el DNI esté completo (7-8 dígitos)
+• Confirmar que el paciente esté registrado
+• Contactar admisión: **4212121**
+
+¿Puedo ayudarte con otra consulta?"""
+
+    async def _format_patient_search_by_name_response(
+        self, user_message: str, query_info: Dict, real_data: Dict, first_name: str
+    ) -> str:
+        """Formatear respuesta de búsqueda de paciente por nombre"""
+
+        if real_data and real_data.get('type') == 'patient_found_by_name':
+            patient_data = real_data['patient']
+            nombre_buscado = real_data['nombre']
+
+            response = f"""🔍 **PACIENTE ENCONTRADO POR NOMBRE**
+
+👤 **Búsqueda:** {nombre_buscado}
+
+📋 **Datos del Paciente:**
+• **Nombre Completo:** {patient_data.get('nombre_completo', 'No disponible')}
+• **DNI:** {patient_data.get('documento', 'No disponible')}
+• **Fecha de Nacimiento:** {patient_data.get('fecha_nacimiento', 'No disponible')}
+• **Edad:** {patient_data.get('edad', 'No especificada')} años
+• **Teléfono:** {patient_data.get('telefono') or 'No registrado'}
+• **Email:** {patient_data.get('email') or 'No disponible'}
+• **Obra Social:** {patient_data.get('obra_social', 'No especificada')}
+
+🏥 **Estado de Internación:**"""
+
+            # Información de internación (SIEMPRE mostrar para directivos)
+            internacion_vigente = patient_data.get('internacion_vigente')
+            if internacion_vigente and internacion_vigente.get('internado'):
+                int_data = internacion_vigente
+                response += f"""
+• **Estado:** INTERNADO
+• **Cama:** {int_data.get('cama', 'No especificada')}
+• **Habitación:** {int_data.get('habitacion', 'No especificada')}
+• **Sector:** {int_data.get('sector', 'No especificado')}
+• **Médico Responsable:** {int_data.get('medico_responsable', 'No asignado')}
+• **Fecha de Ingreso:** {int_data.get('fecha_ingreso', 'No disponible')}
+• **Días Internado:** {int_data.get('dias_internado', 'No calculado')}"""
+            else:
+                response += f"""
+• **Estado:** AMBULATORIO (no internado)
+• **Cama:** No asignada
+• **Sector:** No aplicable
+• **Médico Responsable:** Consulta externa"""
+
+            response += f"""
+
+✅ **Búsqueda exitosa:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
+🏥 **Hospital Regional Santiago del Estero**
+📞 **Consultas:** 4212121"""
+
+            return response
+        else:
+            nombre_buscado = query_info.get('nombre', 'el nombre solicitado')
+            return f"""🔍 **BÚSQUEDA DE PACIENTE POR NOMBRE**
+
+❌ No se encontró paciente con el nombre "{nombre_buscado}" en nuestro sistema.
+
+**Sugerencias:**
+• Verificar la ortografía del nombre completo
+• Probar con nombre y apellido
+• Confirmar que el paciente esté registrado
+• Contactar admisión: **4212121**
+
+**Alternativas de búsqueda:**
+• Búsqueda por DNI (más precisa)
+• Consulta en recepción del hospital
+
+¿Puedo ayudarte con otra consulta, {first_name}?"""
+
+    async def _format_beds_response(
+        self, user_message: str, query_info: Dict, real_data: Dict, first_name: str
+    ) -> str:
+        """Formatear respuesta completa de estadísticas de camas"""
+
+        if not real_data or real_data.get('error'):
+            return f"Hola {first_name}, no pude acceder al estado de camas en este momento. Contacta al 4212121."
+
+        # Extraer estadísticas completas
+        total_camas = real_data.get('total_camas', 0)
+        total_ocupadas = real_data.get('total_ocupadas', 0)
+        total_disponibles = real_data.get('total_disponibles', 0)
+        porcentaje_ocupacion = real_data.get('porcentaje_ocupacion', 0)
+        porcentaje_disponibilidad = real_data.get('porcentaje_disponibilidad', 0)
+        servicio_consultado = real_data.get('servicio_consultado', 'General')
+        fecha_consultada = real_data.get('fecha_consultada')
+        estadisticas_sectores = real_data.get('estadisticas_por_sector', {})
+
+        # Presentar números de manera inteligente
+        if total_camas > 1000:
+            capacidad_desc = f"El sistema hospitalario regional cuenta con {total_camas} camas"
+        else:
+            capacidad_desc = f"Total de camas: {total_camas}"
+
+        response = f"""🛏️ **CAPACIDAD HOSPITALARIA - SANTIAGO DEL ESTERO**
+
+📊 **Estado Actual - {servicio_consultado.upper()}:**
+• **{capacidad_desc}**
+• **Ocupadas:** {total_ocupadas} ({porcentaje_ocupacion}%)
+• **Disponibles:** {total_disponibles} ({porcentaje_disponibilidad}%)"""
+
+        # Agregar información de fecha si se consultó por fecha específica
+        if fecha_consultada:
+            response += f"""
+• **Fecha consultada:** {fecha_consultada}"""
+
+        response += f"""
+• **Actualizado:** {datetime.now().strftime('%H:%M:%S')}
+
+📈 **Indicadores:**"""
+
+        # Indicador visual de ocupación
+        if porcentaje_ocupacion >= 90:
+            response += f"""
+• 🔴 **Ocupación CRÍTICA** ({porcentaje_ocupacion}%) - Capacidad casi completa"""
+        elif porcentaje_ocupacion >= 70:
+            response += f"""
+• 🟡 **Ocupación ALTA** ({porcentaje_ocupacion}%) - Monitoreo requerido"""
+        else:
+            response += f"""
+• 🟢 **Ocupación NORMAL** ({porcentaje_ocupacion}%) - Capacidad adecuada"""
+
+        # Mostrar estadísticas por sector si no se filtró por uno específico
+        if estadisticas_sectores and len(estadisticas_sectores) > 1:
+            response += f"""
+
+🏥 **Detalle por Sectores:**"""
+
+            # Ordenar sectores por ocupación descendente
+            sectores_ordenados = sorted(
+                estadisticas_sectores.items(),
+                key=lambda x: x[1]['porcentaje_ocupacion'],
+                reverse=True
+            )
+
+            for sector, stats in sectores_ordenados[:5]:  # Mostrar solo los 5 más ocupados
+                ocupacion = stats['porcentaje_ocupacion']
+                emoji = "🔴" if ocupacion >= 90 else "🟡" if ocupacion >= 70 else "🟢"
+                response += f"""
+• {emoji} **{sector}**: {stats['disponibles']}/{stats['total']} disponibles ({stats['porcentaje_disponibilidad']}%)"""
+
+            if len(estadisticas_sectores) > 5:
+                response += f"""
+• ➕ **Y {len(estadisticas_sectores) - 5} sectores más...**"""
+
+        response += f"""
+
+🏥 **Contactos:**
+• **Admisión/Reservas:** 4212121
+• **Guardia/Emergencias:** 22323 (int. 911)
+• **Central de Camas:** Interno 950
+
+✅ **Estado actualizado en tiempo real**
+🕐 **Próxima actualización:** {(datetime.now() + timedelta(minutes=15)).strftime('%H:%M')}"""
+
+        return response
+
+    async def _format_volume_response(
+        self, user_message: str, query_info: Dict, real_data: Dict, first_name: str
+    ) -> str:
+        """Formatear respuesta de volumen de pacientes"""
+
+        if not real_data or real_data.get('error'):
+            servicio = query_info.get('servicio', 'el servicio consultado')
+            return f"Hola {first_name}, no pude acceder a los datos de volumen de {servicio}. Contacta al 4212121."
+
+        servicio = real_data.get('servicio', 'Servicio no especificado')
+        periodo = real_data.get('período', 'Período no especificado')
+        turnos_atendidos = real_data.get('total_turnos_atendidos', 0)
+        pacientes_unicos = real_data.get('pacientes_únicos', 0)
+
+        return f"""📊 **VOLUMEN DE PACIENTES ATENDIDOS**
+
+🏥 **Servicio:** {servicio}
+📅 **Período:** {periodo}
+
+📈 **Estadísticas:**
+• **Total turnos atendidos:** {turnos_atendidos}
+• **Pacientes únicos:** {pacientes_unicos}
+• **Promedio por paciente:** {round(turnos_atendidos/pacientes_unicos, 1) if pacientes_unicos > 0 else 0} consultas
+
+✅ **Actualizado:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
+🏥 **Hospital Regional Santiago del Estero**
+📞 **Consultas:** 4212121"""
+
+    async def _format_turnos_response(
+        self, user_message: str, query_info: Dict, real_data: Dict, first_name: str
+    ) -> str:
+        """Formatear respuesta de turnos programados"""
+
+        if not real_data or real_data.get('error'):
+            servicio = query_info.get('servicio', 'el servicio consultado')
+            return f"Hola {first_name}, no pude acceder a los turnos de {servicio}. Contacta al 4212121."
+
+        servicio = real_data.get('servicio', 'Servicio no especificado')
+        total_turnos = real_data.get('total_turnos', 0)
+        turnos = real_data.get('turnos', [])
+
+        response = f"""📅 **TURNOS PROGRAMADOS**
+
+🏥 **Servicio:** {servicio}
+📋 **Total programados:** {total_turnos}
+
+🕒 **Próximos turnos:**"""
+
+        if turnos:
+            for i, turno in enumerate(turnos[:5], 1):  # Mostrar solo los primeros 5
+                fecha = turno.get('fecha', 'Fecha no disponible')
+                hora = turno.get('hora', 'Hora no disponible')
+                paciente = turno.get('paciente', 'Paciente no especificado')
+                medico = turno.get('medico', 'Médico no asignado')
+
+                response += f"""
+**{i}.** {fecha} - {hora}
+   • Paciente: {paciente}
+   • Médico: {medico}"""
+        else:
+            response += "\n• No hay turnos programados"
+
+        response += f"""
+
+✅ **Actualizado:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
+🏥 **Hospital Regional Santiago del Estero**
+📞 **Para turnos:** 4212121"""
+
+        return response
+
+    async def _format_horarios_response(
+        self, user_message: str, query_info: Dict, real_data: Dict, first_name: str
+    ) -> str:
+        """Formatear respuesta de horarios de atención"""
+
+        if not real_data or real_data.get('error'):
+            servicio = query_info.get('servicio', 'el servicio consultado')
+            return f"Hola {first_name}, no pude acceder a los horarios de {servicio}. Contacta al 4212121."
+
+        servicio = real_data.get('servicio', 'Servicio no especificado')
+        horarios = real_data.get('horarios', [])
+        consultorios = real_data.get('consultorios', 0)
+
+        response = f"""🕒 **HORARIOS DE ATENCIÓN**
+
+🏥 **Servicio:** {servicio}
+🏢 **Consultorios disponibles:** {consultorios}
+
+📅 **Horarios por día:**"""
+
+        if horarios:
+            for horario in horarios:
+                dia = horario.get('dia', 'Día no especificado')
+                hora_inicio = horario.get('hora_inicio', 'No disponible')
+                hora_fin = horario.get('hora_fin', 'No disponible')
+                cantidad = horario.get('cantidad_turnos', 0)
+
+                response += f"""
+• **{dia}:** {hora_inicio} - {hora_fin} ({cantidad} turnos)"""
+        else:
+            response += "\n• Horarios no disponibles"
+
+        response += f"""
+
+✅ **Información basada en turnos programados**
+🏥 **Hospital Regional Santiago del Estero**
+📞 **Para consultas:** 4212121"""
+
+        return response
+
+    def _format_context_for_langgraph(
+        self, history: List[Dict], hospital_id: str, current_message: str
+    ) -> str:
+        """Formatear contexto para LangGraph"""
+
+        context_parts = [f"Hospital ID: {hospital_id}"]
+        context_parts.append(f"Consulta actual: {current_message}")
+
+        if history:
+            context_parts.append("Historial reciente:")
+            recent = history[-4:] if len(history) > 4 else history
+            for msg in recent:
+                msg_type = msg.get('type', 'unknown')
+                content = msg.get('message', '')[:80]
+                context_parts.append(f"{msg_type}: {content}...")
+
+        return "\n".join(context_parts)
+
+    def _save_to_memory(
+        self, conversation_id: str, user_message: str, bot_response: str,
+        intent: str, confidence: float, hospital_id: str
+    ):
+        """Guardar interacción en memoria Redis tradicional"""
+        history = self._get_conversation_history(conversation_id)
+        timestamp = datetime.now().isoformat()
+
+        # Agregar nueva interacción
+        history.append({
+            "type": "user_message",
+            "message": user_message,
+            "timestamp": timestamp,
+            "intent": intent,
+            "confidence": confidence
+        })
+
+        history.append({
+            "type": "bot_response",
+            "message": bot_response,
+            "timestamp": timestamp,
+            "intent": intent
+        })
+
+        # Mantener solo los últimos mensajes
+        if len(history) > self.max_memory_messages:
+            history = history[-self.max_memory_messages:]
+
+        # Guardar
+        self._save_conversation_history(conversation_id, history)
+        logger.info(f"💾 Memoria actualizada: {conversation_id} - {intent}")
+
+    def _save_to_memory_fallback(
+        self, conversation_id: str, user_message: str, bot_response: str,
+        intent: str, confidence: float, hospital_id: str
+    ):
+        """Fallback a memoria Redis tradicional si falla la híbrida"""
+        history = self._get_conversation_history(conversation_id)
+        timestamp = datetime.now().isoformat()
+
+        # Agregar nuevos mensajes
+        history.extend([
+            {
+                'type': 'user',
+                'message': user_message,
+                'timestamp': timestamp,
+                'intent': intent
+            },
+            {
+                'type': 'bot',
+                'message': bot_response,
+                'timestamp': timestamp,
+                'confidence': confidence,
+                'hospital_id': hospital_id
+            }
+        ])
+
+        # Mantener solo mensajes recientes
+        if len(history) > self.max_memory_messages * 2:
+            history = history[-self.max_memory_messages * 2:]
+
+        # Guardar en Redis
+        self._save_conversation_history(conversation_id, history)
+
+        logger.info(f"🧠 Memoria fallback actualizada: {conversation_id} - {len(history)} mensajes")
+
+    async def _intelligent_fallback(
+        self, user_message: str, hospital_id: str, first_name: str
+    ) -> tuple:
+        """Fallback inteligente para consultas generales usando ORM directo"""
+        try:
+            message_lower = user_message.lower()
+
+            # Detectar consultas sobre especialidades
+            if any(word in message_lower for word in ['especialidad', 'especialidades']):
+                logger.info("🎯 Fallback detectó consulta de especialidades")
+                result = await orm_hospital_service.obtener_especialidades_con_prestadores(int(hospital_id))
+
+                if result.success and result.data:
+                    count = len(result.data)
+                    response = f"""🏥 **ESPECIALIDADES DISPONIBLES**
+
+📋 **Tenemos {count} especialidades médicas:**
+
+"""
+                    for i, esp in enumerate(result.data[:10], 1):
+                        nombre = esp.get('nombre', 'Sin nombre').strip()
+                        cantidad = esp.get('cantidad_prestadores', 0)
+                        response += f"• **{nombre}** - {cantidad} prestadores\n"
+
+                    response += f"""
+✅ **Información actualizada**
+📞 **Consultas:** 4212121"""
+
+                    return response, 0.9, "SPECIALTIES_INFO"
+
+            # Detectar consultas sobre camas
+            elif any(word in message_lower for word in ['cama', 'camas', 'disponible']):
+                logger.info("🛏️ Fallback detectó consulta de camas")
+                result = await orm_hospital_service.obtener_disponibilidad_camas(int(hospital_id))
+
+                if result.success and result.data:
+                    data = result.data
+                    resumen = data.get('resumen', {})
+
+                    response = f"""🛏️ **ESTADO DE CAMAS**
+
+📊 **Disponibilidad:**
+• **Total:** {resumen.get('total_camas', 0)} camas
+• **Disponibles:** {resumen.get('disponibles', 0)} camas
+• **Ocupadas:** {resumen.get('ocupadas', 0)} camas
+• **Ocupación:** {resumen.get('porcentaje_ocupacion', 0)}%
+
+✅ **Estado en tiempo real**
+📞 **Admisión:** 4212121"""
+
+                    return response, 0.9, "BEDS_STATUS"
+
+            # Respuesta general con IA
+            logger.info("🤖 Generando respuesta general con IA")
+
+            prompt = f"""Eres ZisBot, asistente médico virtual del Hospital Regional Santiago del Estero.
+
+CONSULTA DEL USUARIO: "{user_message}"
+
+INSTRUCCIONES:
+1. Responde de manera profesional y amigable
+2. Ofrece ayuda con consultas hospitalarias
+3. Menciona que puedes ayudar con: pacientes, camas, especialidades, turnos
+4. Incluye teléfonos: 4212121 (admisión) y 22323 (guardia)
+5. Mantén un tono conversacional
+
+Genera una respuesta útil y profesional."""
+
+            ai_response = await self.llm.ainvoke(prompt)
+            response = ai_response.content.strip()
+
+            return response, 0.8, "AI_GENERAL_RESPONSE"
+
+        except Exception as e:
+            logger.error(f"❌ Error en fallback: {e}")
+            return f"Hola {first_name}, tengo problemas técnicos. Llama al 4212121.", 0.1, "error"
+
+
+# ===============================================
+# INSTANCIA GLOBAL Y FUNCIONES
+# ===============================================
+
+chatbot_service: Optional[ChatbotService] = None
+
+async def init_chatbot_service(groq_api_key: str, redis_url: str = "redis://localhost:6379"):
+    """Inicializar servicio de chatbot"""
+    global chatbot_service
+    chatbot_service = ChatbotService(groq_api_key, redis_url)
+    logger.info("🚀 ChatbotService inicializado globalmente")
+
+async def get_chatbot_service() -> ChatbotService:
+    """Obtener instancia del servicio de chatbot"""
+    if chatbot_service is None:
+        raise ValueError("ChatbotService no inicializado")
+    return chatbot_service
