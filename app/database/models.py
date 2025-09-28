@@ -1,7 +1,7 @@
 """
 Modelos ORM limpios según estructura real de la BD DBH_Test
 """
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 
@@ -26,6 +26,9 @@ class Paciente(Base):
     Telefono = Column(String(50))
     Correo = Column(String(100))
     Anulado = Column(Boolean, default=False)
+
+    # Relaciones
+    consultas = relationship("ConsultaAmbulatoria", back_populates="paciente")
 
 class Especialidad(Base):
     """Modelo ORM para tabla Especialidades"""
@@ -200,3 +203,26 @@ class Turno(Base):
     consultorio = relationship("Consultorio", back_populates="turnos")
     prestador = relationship("Prestador")
     institucion = relationship("Institucion")
+
+class ConsultaAmbulatoria(Base):
+    """Modelo ORM para tabla Consultas_Ambulatorias"""
+    __tablename__ = 'Consultas_Ambulatorias'
+
+    ConsultaID = Column(Integer, primary_key=True)
+    PacienteID = Column(Integer, ForeignKey('Pacientes.PacienteID'))
+    TurnoID = Column(Integer, ForeignKey('Turnos.TurnoID'))
+    PrestadorID = Column(Integer, ForeignKey('Prestadores.PrestadorID'))
+    ServicioID = Column(Integer, ForeignKey('Servicios.ServicioID'))
+    FechaConsulta = Column(DateTime)
+    MotivoConsulta = Column(Text)
+    Diagnostico = Column(Text)
+    EvolucionClinica = Column(Text)
+    IndicacionesTerapeuticas = Column(Text)
+    Anulado = Column(Boolean, default=False)
+    InstitucionID = Column(Integer)
+
+    # Relaciones
+    paciente = relationship("Paciente", back_populates="consultas")
+    turno = relationship("Turno")
+    prestador = relationship("Prestador")
+    servicio = relationship("Servicio")

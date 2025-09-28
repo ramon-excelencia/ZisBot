@@ -419,6 +419,15 @@ async def chat_endpoint(
             detail=f"Error específico: {str(e)}"
         )
 
+@app.get("/health")
+async def health_check():
+    """Health check simple para monitoreo"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "version": settings.APP_VERSION
+    }
+
 @app.get("/api/system/status")
 async def system_status() -> SystemStatus:
     """Estado detallado del sistema"""

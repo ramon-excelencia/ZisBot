@@ -7,6 +7,7 @@ import json
 import re
 import redis
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 
@@ -53,7 +54,94 @@ class ChatbotService:
         # Memory settings
         self.max_memory_messages = 10
 
+        # Cache settings
+        self.cache_expiry = 300  # 5 minutos
         logger.info("🚀 ChatbotService inicializado correctamente")
+
+    def _clean_text(self, text: str) -> str:
+        """Limpiar texto eliminando espacios excesivos y caracteres extra"""
+        if not text or text == 'None':
+            return 'No disponible'
+        # Remover espacios múltiples y limpiar
+        cleaned = ' '.join(text.split())
+        return cleaned.strip()
+
+    def _generate_helpful_suggestions(self, query_type: str, original_query: str) -> str:
+        """Generar sugerencias útiles basadas en el tipo de consulta"""
+        suggestions = {
+            'volumen_pacientes': [
+                '• "pacientes atendidos en traumatología esta semana"',
+                '• "volumen de consultas del 1 al 15 de octubre"',
+                '• "cantidad de atendidos en laboratorio últimos 30 días"',
+                '• "turnos por servicio entre 01/09/2024 y 30/09/2024"'
+            ],
+            'horarios_atencion': [
+                '• "horarios de traumatología"',
+                '• "cuándo atiende el servicio de laboratorio"',
+                '• "horarios de consultas externas"',
+                '• "disponibilidad de especialistas"'
+            ],
+            'camas_disponibles': [
+                '• "camas en terapia intensiva"',
+                '• "disponibilidad en sala general"',
+                '• "ocupación de emergencias"',
+                '• "estado de camas pediátricas"'
+            ]
+        }
+
+        return '\n'.join(suggestions.get(query_type, [
+            '• "camas disponibles"',
+            '• "historia clínica de [nombre/DNI]"',
+            '• "horarios de [especialidad]"',
+            '• "volumen de atención esta semana"'
+        ]))
+
+    def _validate_input(self, user_message: str) -> tuple[bool, str]:
+        """Validar entrada del usuario para seguridad"""
+        if not user_message or not user_message.strip():
+            return False, "Mensaje vacío"
+
+        # Limitar longitud del mensaje
+        if len(user_message) > 1000:
+            return False, "Mensaje demasiado largo (máximo 1000 caracteres)"
+
+        # Detectar patrones de inyección básicos
+        dangerous_patterns = [
+            'DROP TABLE', 'DELETE FROM', 'INSERT INTO', 'UPDATE SET',
+            'EXEC', 'EXECUTE', 'SCRIPT', 'javascript:', 'onload=',
+            '<script', '</script>', 'eval(', 'alert('
+        ]
+
+        message_upper = user_message.upper()
+        for pattern in dangerous_patterns:
+            if pattern in message_upper:
+                return False, f"Patrón no permitido detectado: {pattern}"
+
+        return True, "Válido"
+
+    def _get_cache_key(self, query_type: str, hospital_id: str, **params) -> str:
+        """Generar clave de caché para consultas"""
+        param_str = "_".join([f"{k}:{v}" for k, v in sorted(params.items()) if v is not None])
+        return f"cache:{hospital_id}:{query_type}:{param_str}"
+
+    def _get_cached_result(self, cache_key: str) -> Optional[Dict]:
+        """Obtener resultado desde caché"""
+        if self.redis:
+            try:
+                cached_data = self.redis.get(cache_key)
+                if cached_data:
+                    return json.loads(cached_data)
+            except Exception as e:
+                logger.warning(f"Error leyendo caché: {e}")
+        return None
+
+    def _set_cache_result(self, cache_key: str, data: Dict):
+        """Guardar resultado en caché"""
+        if self.redis:
+            try:
+                self.redis.setex(cache_key, self.cache_expiry, json.dumps(data, default=str))
+            except Exception as e:
+                logger.warning(f"Error escribiendo caché: {e}")
 
     def _get_conversation_key(self, conversation_id: str) -> str:
         """Generar clave Redis para conversación"""
@@ -98,7 +186,14 @@ class ChatbotService:
         """
         Procesar mensaje del usuario usando el sistema completo
         """
+        start_time = time.time()
         try:
+            # 0. VALIDAR ENTRADA
+            is_valid, validation_msg = self._validate_input(user_message)
+            if not is_valid:
+                logger.warning(f"⚠️ Entrada inválida: {validation_msg}")
+                return f"❌ Entrada no válida: {validation_msg}. Por favor reformule su consulta."
+
             # 1. OBTENER HISTORIAL DE CONVERSACIÓN
             history = self._get_conversation_history(conversation_id)
             display_name = user_name or "Usuario"
@@ -119,10 +214,28 @@ class ChatbotService:
 
             # 3. SI ES CONSULTA MÉDICA ESPECÍFICA, OBTENER DATOS REALES
             if query_info['type'] != 'general':
-                logger.info(f"🏥 Obteniendo datos reales para: {query_info['type']}")
-                # Determinar rol del usuario (por defecto directivo para Fase 1)
-                user_role = 'directivo'  # En Fase 1 todos los usuarios son directivos
-                real_data = await self._get_real_hospital_data(query_info, user_id, user_role)
+                # Verificar caché para consultas frecuentes
+                cache_key = None
+                if query_info['type'] == 'camas_disponibles':
+                    cache_key = self._get_cache_key(
+                        'camas_disponibles',
+                        hospital_id,
+                        servicio=query_info.get('servicio'),
+                        fecha=query_info.get('fecha')
+                    )
+                    real_data = self._get_cached_result(cache_key)
+
+                if not real_data:
+                    logger.info(f"🏥 Obteniendo datos reales para: {query_info['type']}")
+                    # Determinar rol del usuario (por defecto directivo para Fase 1)
+                    user_role = 'directivo'  # En Fase 1 todos los usuarios son directivos
+                    real_data = await self._get_real_hospital_data(query_info, user_id, user_role)
+
+                    # Guardar en caché si es consulta de camas
+                    if real_data and cache_key and query_info['type'] == 'camas_disponibles':
+                        self._set_cache_result(cache_key, real_data)
+                else:
+                    logger.info(f"⚡ Usando datos desde caché para: {query_info['type']}")
 
                 if real_data:
                     logger.info(f"✅ Datos reales obtenidos exitosamente")
@@ -183,7 +296,9 @@ class ChatbotService:
                 conversation_id, user_message, response, intent, confidence, hospital_id
             )
 
-            logger.info(f"✅ Respuesta generada - Intent: {intent}, Confianza: {confidence}")
+            # Calcular tiempo de procesamiento
+            processing_time = round((time.time() - start_time) * 1000, 2)  # en ms
+            logger.info(f"✅ Respuesta generada - Intent: {intent}, Confianza: {confidence}, Tiempo: {processing_time}ms")
             return response
 
         except Exception as e:
@@ -234,14 +349,15 @@ class ChatbotService:
                 }
 
         # 3. VOLUMEN DE PACIENTES POR SERVICIO/FECHAS (PRIORIDAD ALTA)
-        if any(word in message_lower for word in ['pacientes atendidos', 'volumen', 'cantidad atendidos', 'atendidos']):
-            servicio, mes, año = self._extract_service_and_date(message_lower)
-            logger.info(f"📊 DETECTADO: volumen_pacientes, servicio: {servicio}, mes: {mes}, año: {año}")
+        if any(word in message_lower for word in ['pacientes atendidos', 'volumen', 'cantidad atendidos', 'atendidos', 'volumen de atencion', 'consultas por servicio']):
+            servicio = self._extract_service_name(message_lower)
+            fecha_desde, fecha_hasta = self._extract_date_range(message_lower)
+            logger.info(f"📊 DETECTADO: volumen_pacientes, servicio: {servicio}, fechas: {fecha_desde} a {fecha_hasta}")
             return {
                 'type': 'volumen_pacientes',
                 'servicio': servicio,
-                'mes': mes,
-                'año': año
+                'fecha_desde': fecha_desde,
+                'fecha_hasta': fecha_hasta
             }
 
         # 4. TURNOS PROGRAMADOS
@@ -293,8 +409,24 @@ class ChatbotService:
                 'documento': dni
             }
 
-        # 8. BÚSQUEDA DE PACIENTE POR NOMBRE
-        if any(word in message_lower for word in ['buscar', 'busca', 'datos del paciente', 'paciente']):
+        # 7. VOLUMEN DE PACIENTES - ANTES DE BÚSQUEDA DE NOMBRE
+        if any(phrase in message_lower for phrase in ['cuantos pacientes', 'cantidad de pacientes', 'pacientes atendidos', 'volumen de pacientes', 'estadisticas de pacientes']):
+            fecha_desde, fecha_hasta = self._extract_date_range_from_message(message_lower)
+            servicio = self._extract_service_name(message_lower)
+            logger.info(f"📊 DETECTADO: volumen_pacientes, servicio: {servicio}, fechas: {fecha_desde}-{fecha_hasta}")
+            return {
+                'type': 'volumen_pacientes',
+                'servicio': servicio,
+                'fecha_desde': fecha_desde,
+                'fecha_hasta': fecha_hasta
+            }
+
+        # 8. BÚSQUEDA DE PACIENTE POR NOMBRE - MÁS ESPECÍFICA
+        # Solo buscar si hay patrones específicos de búsqueda de paciente
+        if (any(phrase in message_lower for phrase in ['buscar paciente', 'busca paciente', 'datos del paciente', 'paciente con nombre'])
+            or (any(word in message_lower for word in ['buscar', 'busca']) and 'nombre' in message_lower)
+            or (any(word in message_lower for word in ['buscar', 'busca']) and 'apellido' in message_lower)):
+
             paciente_info = self._extract_patient_info(message)
             if paciente_info.get('nombre'):
                 logger.info(f"👤 DETECTADO: busqueda_paciente_nombre, paciente: {paciente_info}")
@@ -303,7 +435,7 @@ class ChatbotService:
                     'nombre': paciente_info.get('nombre')
                 }
 
-        # 8. CONSULTA GENERAL
+        # 9. CONSULTA GENERAL
         logger.info(f"❓ DETECTADO: consulta_general")
         return {'type': 'general'}
 
@@ -316,17 +448,19 @@ class ChatbotService:
         documento = dni_match.group(1) if dni_match else None
         logger.info(f"🆔 DNI: {documento}")
 
-        # Extraer nombre con patrones mejorados
+        # Extraer nombre con patrones mejorados - ORDEN ESPECÍFICO A GENERAL
         name_patterns = [
-            # Patrón 1: "con nombre [NOMBRE]", "llamado [NOMBRE]"
-            r'(?:con\s+nombre|llamad[oa])\s+([A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+(?:\s+[A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+)*)',
-            # Patrón 2: "nombre [NOMBRE]" directo
-            r'nombre\s+([A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+(?:\s+[A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+)*)',
-            # Patrón 3: "siguiente paciente/nombre: [NOMBRE]"
+            # Patrón 1: "con apellido [APELLIDO]" - MÁS ESPECÍFICO - SOLO ÚLTIMA PALABRA
+            r'(?:con\s+apellido|apellido)\s+([A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+)(?:\s|$)',
+            # Patrón 2: "con nombre [NOMBRE]" - SOLO PRIMERA PALABRA DESPUÉS
+            r'(?:con\s+nombre)\s+([A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+)(?:\s|$)',
+            # Patrón 3: "llamado [NOMBRE]"
+            r'llamad[oa]\s+([A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+(?:\s+[A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+)*)',
+            # Patrón 4: "siguiente paciente/nombre: [NOMBRE]"
             r'siguiente\s+(?:paciente|nombre)[\s:]+([A-ZÁÉÍÓÚñÑa-záéíóúñÑ\s]+)',
-            # Patrón 4: Nombres todo en mayúsculas (formato hospital)
+            # Patrón 5: Nombres todo en mayúsculas (formato hospital)
             r'\b([A-ZÁÉÍÓÚÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ]{2,})+)\b',
-            # Patrón 5: Formato título tradicional
+            # Patrón 6: Formato título tradicional
             r'(?:historia|historial|clinica|expediente).*?(?:de|del|para)\s+([A-ZÁÉÍÓÚñÑ][a-záéíóúñÑ]+\s+[A-ZÁÉÍÓÚñÑ][a-záéíóúñÑ]+)',
         ]
 
@@ -481,6 +615,115 @@ class ChatbotService:
 
         return None
 
+    def _extract_date_range_from_message(self, message_lower: str) -> tuple:
+        """Extraer rango de fechas del mensaje"""
+        from datetime import date, timedelta
+        import re
+
+        # Detectar rangos de tiempo comunes
+        if any(phrase in message_lower for phrase in ['ultimos 30 dias', 'último mes', 'ultimo mes']):
+            fecha_hasta = date.today()
+            fecha_desde = fecha_hasta - timedelta(days=30)
+            return fecha_desde, fecha_hasta
+
+        if any(phrase in message_lower for phrase in ['ultimos 7 dias', 'última semana', 'ultima semana']):
+            fecha_hasta = date.today()
+            fecha_desde = fecha_hasta - timedelta(days=7)
+            return fecha_desde, fecha_hasta
+
+        if any(phrase in message_lower for phrase in ['ultimos 15 dias', 'últimas 2 semanas']):
+            fecha_hasta = date.today()
+            fecha_desde = fecha_hasta - timedelta(days=15)
+            return fecha_desde, fecha_hasta
+
+        if any(phrase in message_lower for phrase in ['este mes', 'mes actual']):
+            hoy = date.today()
+            fecha_desde = date(hoy.year, hoy.month, 1)
+            fecha_hasta = hoy
+            return fecha_desde, fecha_hasta
+
+        # Por defecto: últimos 30 días
+        fecha_hasta = date.today()
+        fecha_desde = fecha_hasta - timedelta(days=30)
+        return fecha_desde, fecha_hasta
+
+    def _extract_date_range(self, message_lower: str) -> tuple:
+        """Extraer rango de fechas del mensaje"""
+        import re
+        from datetime import datetime, date, timedelta
+
+        # Patrones para rangos de fechas
+        range_patterns = [
+            r'entre\s+(\d{1,2}[/-]\d{1,2}[/-]\d{4})\s+y\s+(\d{1,2}[/-]\d{1,2}[/-]\d{4})',  # entre DD/MM/YYYY y DD/MM/YYYY
+            r'del\s+(\d{1,2}[/-]\d{1,2}[/-]\d{4})\s+al\s+(\d{1,2}[/-]\d{1,2}[/-]\d{4})',    # del DD/MM/YYYY al DD/MM/YYYY
+            r'desde\s+(\d{1,2}[/-]\d{1,2}[/-]\d{4})\s+hasta\s+(\d{1,2}[/-]\d{1,2}[/-]\d{4})', # desde DD/MM/YYYY hasta DD/MM/YYYY
+            r'del\s+(\d{1,2})\s+al\s+(\d{1,2})\s+de\s+(\w+)', # del 1 al 15 de octubre
+            r'entre\s+el\s+(\d{1,2})\s+y\s+el\s+(\d{1,2})\s+de\s+(\w+)', # entre el 1 y el 15 de octubre
+            r'esta\s+semana',
+            r'este\s+mes',
+            r'últimos?\s+(\d+)\s+días?',
+            r'pasados?\s+(\d+)\s+días?'
+        ]
+
+        meses_esp = {
+            'enero': 1, 'febrero': 2, 'marzo': 3, 'abril': 4, 'mayo': 5, 'junio': 6,
+            'julio': 7, 'agosto': 8, 'septiembre': 9, 'octubre': 10, 'noviembre': 11, 'diciembre': 12
+        }
+
+        hoy = date.today()
+
+        for pattern in range_patterns:
+            match = re.search(pattern, message_lower)
+            if match:
+                if pattern == r'esta\s+semana':
+                    # Lunes de esta semana hasta hoy
+                    inicio_semana = hoy - timedelta(days=hoy.weekday())
+                    return inicio_semana, hoy
+
+                elif pattern == r'este\s+mes':
+                    # Primer día del mes hasta hoy
+                    inicio_mes = hoy.replace(day=1)
+                    return inicio_mes, hoy
+
+                elif 'últimos' in pattern or 'pasados' in pattern:
+                    # Últimos N días
+                    dias = int(match.group(1))
+                    fecha_inicio = hoy - timedelta(days=dias)
+                    return fecha_inicio, hoy
+
+                elif len(match.groups()) == 2 and all('/' in g or '-' in g for g in match.groups()):
+                    # Fechas completas DD/MM/YYYY
+                    try:
+                        fecha1_str, fecha2_str = match.groups()
+
+                        # Parsear primera fecha
+                        parts1 = re.split(r'[/-]', fecha1_str)
+                        fecha1 = date(int(parts1[2]), int(parts1[1]), int(parts1[0]))
+
+                        # Parsear segunda fecha
+                        parts2 = re.split(r'[/-]', fecha2_str)
+                        fecha2 = date(int(parts2[2]), int(parts2[1]), int(parts2[0]))
+
+                        return fecha1, fecha2
+                    except (ValueError, IndexError):
+                        continue
+
+                elif len(match.groups()) == 3:
+                    # Formato: del 1 al 15 de octubre
+                    try:
+                        dia1, dia2, mes_nombre = match.groups()
+                        mes_num = meses_esp.get(mes_nombre.lower())
+                        if mes_num:
+                            año_actual = hoy.year
+                            fecha1 = date(año_actual, mes_num, int(dia1))
+                            fecha2 = date(año_actual, mes_num, int(dia2))
+                            return fecha1, fecha2
+                    except (ValueError, KeyError):
+                        continue
+
+        # Si no encuentra rango específico, usar últimos 30 días por defecto
+        return hoy - timedelta(days=30), hoy
+
     def _validate_user_permissions(self, user_id: str, user_role: str, patient_dni: str = None) -> Dict[str, bool]:
         """
         Validar permisos de usuario para acceso a datos de pacientes
@@ -567,11 +810,21 @@ class ChatbotService:
                         'contact_info': "Contacta al administrador del sistema para solicitar acceso."
                     }
 
-                # Usar hospital_data_service para historia clínica
-                result = await hospital_data_service.get_historia_clinica(
-                    documento=query_info.get('documento'),
+                # Usar ORM para historia clínica completa (más detallada)
+                result = await orm_hospital_service.obtener_historia_clinica_completa(
+                    dni=query_info.get('documento'),
                     nombre=query_info.get('nombre')
                 )
+
+                # Convertir ApiResponse a dict para compatibilidad
+                if hasattr(result, 'success') and result.success:
+                    result = result.data
+                else:
+                    # Fallback al servicio anterior
+                    result = await hospital_data_service.get_historia_clinica(
+                        documento=query_info.get('documento'),
+                        nombre=query_info.get('nombre')
+                    )
 
                 if result:
                     result['user_permissions'] = permissions
@@ -593,15 +846,29 @@ class ChatbotService:
                     }
 
                 if dni:
-                    result = await orm_hospital_service.buscar_paciente_por_dni(dni, 3)
-                    if result.success:
-                        logger.info(f"📋 Historia clínica autorizada por DNI: {dni} para usuario: {user_id}")
+                    # Usar historia clínica completa para DNI específico
+                    result = await orm_hospital_service.obtener_historia_clinica_completa(dni=dni)
+                    if hasattr(result, 'success') and result.success:
+                        logger.info(f"📋 Historia clínica completa autorizada por DNI: {dni} para usuario: {user_id}")
+                        historia_completa = result.data
+                        historia_completa['user_permissions'] = permissions
                         return {
                             'type': 'historia_clinica_found',
-                            'patient': result.data,
+                            'historia_completa': historia_completa,
                             'dni': dni,
                             'user_permissions': permissions
                         }
+                    else:
+                        # Fallback a búsqueda básica
+                        result = await orm_hospital_service.buscar_paciente_por_dni(dni, 3)
+                        if result.success:
+                            logger.info(f"📋 Datos básicos por DNI: {dni} para usuario: {user_id}")
+                            return {
+                                'type': 'historia_clinica_found',
+                                'patient': result.data,
+                                'dni': dni,
+                                'user_permissions': permissions
+                            }
                 return None
 
             elif query_type == 'busqueda_paciente_dni':
@@ -641,11 +908,15 @@ class ChatbotService:
                 return result
 
             elif query_type == 'volumen_pacientes':
-                # Usar hospital_data_service para volumen de pacientes
-                servicio = query_info.get('servicio', 'medicina_general')
-                mes = query_info.get('mes', datetime.now().month)
-                año = query_info.get('año', datetime.now().year)
-                result = await hospital_data_service.get_volumen_pacientes(servicio, mes, año)
+                # Usar hospital_data_service para volumen de pacientes con rangos de fechas
+                servicio = query_info.get('servicio')
+                fecha_desde = query_info.get('fecha_desde')
+                fecha_hasta = query_info.get('fecha_hasta')
+                result = await hospital_data_service.get_volumen_pacientes(
+                    servicio_nombre=servicio,
+                    fecha_desde=fecha_desde,
+                    fecha_hasta=fecha_hasta
+                )
                 logger.info(f"📊 Volumen pacientes resultado: {result is not None}")
                 return result
 
@@ -844,49 +1115,92 @@ Hola {first_name}, {real_data.get('message')}
 📞 **Soporte:** 4212121 - Interno 950"""
 
         if real_data and real_data.get('type') == 'historia_clinica_found':
-            patient = real_data['patient']
+            # Manejar tanto formato nuevo (historia_completa) como viejo (patient)
+            if 'historia_completa' in real_data:
+                historia_completa = real_data['historia_completa']
+                patient = historia_completa['paciente']
+                internaciones = historia_completa.get('internaciones', [])
+                turnos = historia_completa.get('turnos_medicos', [])
+                resumen = historia_completa.get('resumen', {})
+            else:
+                # Fallback para formato antiguo
+                patient = real_data['patient']
+                internaciones = []
+                turnos = []
+                resumen = {}
+
             dni = real_data['dni']
 
             # Protección para campos que pueden ser None
             nombre = patient.get('nombre_completo', 'No disponible')
             documento = patient.get('documento', 'No disponible')
 
-            response = f"""📋 **HISTORIA CLÍNICA - DNI {dni}**
+            # Formatear respuesta con datos completos
+            response = f"""📋 **HISTORIA CLÍNICA COMPLETA - DNI {dni}**
 
 👤 **Datos del Paciente:**
 • **Nombre:** {nombre.strip() if nombre else 'No disponible'}
 • **Documento:** {documento.strip() if documento else 'No disponible'}
 • **Edad:** {patient.get('edad', 'No especificada')} años
-• **Obra Social:** {patient.get('obra_social', 'No especificada')}
-
-📞 **Contacto:**
+• **CUIL:** {patient.get('cuil', 'No disponible')}
 • **Teléfono:** {patient.get('telefono') or 'No registrado'}
-• **Email:** {patient.get('email') or 'No disponible'}"""
+• **Email:** {patient.get('correo') or 'No disponible'}"""
 
-            # Información de internación si existe
-            internacion_vigente = patient.get('internacion_vigente')
-            if internacion_vigente and internacion_vigente.get('internado'):
-                int_data = internacion_vigente
+            # Resumen estadístico si está disponible
+            if resumen:
+                total_int = resumen.get('total_internaciones', 0)
+                internacion_actual = resumen.get('internacion_actual', False)
+                total_turnos = resumen.get('total_turnos', 0)
+
                 response += f"""
 
-🏥 **Estado Actual - INTERNADO:**
-• **Cama:** {int_data.get('cama', 'No especificada')}
-• **Habitación:** {int_data.get('habitacion', 'No especificada')}
-• **Sector:** {int_data.get('sector', 'No especificado')}
-• **Médico Responsable:** {int_data.get('medico_responsable', 'No asignado')}
-• **Fecha de Ingreso:** {int_data.get('fecha_ingreso', 'No disponible')}
-• **Días Internado:** {int_data.get('dias_internado', 'No calculado')}"""
-            else:
-                response += "\n\n🏠 **Estado:** Paciente ambulatorio (no internado)"
+📊 **Resumen Clínico:**
+• **Total Internaciones:** {total_int}
+• **Estado Actual:** {'INTERNADO' if internacion_actual else 'AMBULATORIO'}
+• **Turnos Registrados:** {total_turnos}"""
+
+            # Información de internaciones
+            if internaciones:
+                response += "\n\n🏥 **INTERNACIONES:**"
+                for i, int_data in enumerate(internaciones[:3], 1):  # Mostrar máximo 3
+                    estado = int_data.get('estado', 'Desconocido')
+                    fecha_ing = int_data.get('fecha_ingreso', 'No disponible')
+                    fecha_alt = int_data.get('fecha_alta', 'Sin alta')
+                    cama = int_data.get('cama', 'No especificada')
+                    sector = int_data.get('sector', 'No especificado')
+                    medico = int_data.get('medico_ingreso', 'No asignado')
+
+                    response += f"""
+  {i}. **{estado.upper()}**
+     • Ingreso: {fecha_ing} | Alta: {fecha_alt}
+     • Ubicación: {sector} - {cama}
+     • Médico: {medico}"""
+
+                if len(internaciones) > 3:
+                    response += f"\n     ... y {len(internaciones) - 3} internaciones más"
+
+            # Información de turnos médicos
+            if turnos:
+                response += "\n\n📅 **TURNOS MÉDICOS RECIENTES:**"
+                for i, turno in enumerate(turnos[:5], 1):  # Mostrar máximo 5
+                    fecha = turno.get('fecha_hora', 'No disponible')
+                    especialidad = turno.get('especialidad', 'Sin especialidad')
+                    medico = turno.get('medico', 'No asignado')
+                    estado = turno.get('estado', 'Desconocido')
+
+                    response += f"""
+  {i}. {fecha}
+     • Especialidad: {especialidad}
+     • Médico: {medico}
+     • Estado: {estado}"""
+
+                if len(turnos) > 5:
+                    response += f"\n     ... y {len(turnos) - 5} turnos más"
+
+            elif not internaciones:
+                response += "\n\n🏠 **Estado:** Paciente ambulatorio (sin internaciones recientes)"
 
             response += f"""
-
-📋 **Información Disponible:**
-• Historia clínica registrada en el sistema
-• Datos de contacto actualizados
-• Información de obra social vigente
-
-⚠️ **Nota:** Para acceder a detalles médicos específicos, consulte el sistema hospitalario completo.
 
 ✅ **Consulta realizada:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
 🏥 **Hospital Regional Santiago del Estero**
@@ -926,12 +1240,12 @@ Hola {first_name}, {real_data.get('message')}
             response = f"""🏥 **PACIENTE ENCONTRADO**
 
 📋 **Información Completa:**
-• **Nombre:** {nombre.strip() if nombre else 'No disponible'}
-• **DNI:** {documento.strip() if documento else 'No disponible'}
+• **Nombre:** {self._clean_text(nombre)}
+• **DNI:** {self._clean_text(documento)}
 • **Edad:** {patient.get('edad', 'No especificada')} años
-• **Teléfono:** {patient.get('telefono') or 'No registrado'}
-• **Email:** {patient.get('email') or 'No disponible'}
-• **Obra Social:** {patient.get('obra_social', 'No especificada')}
+• **Teléfono:** {self._clean_text(str(patient.get('telefono', '')))}
+• **Email:** {self._clean_text(str(patient.get('email', '')))}
+• **Obra Social:** {self._clean_text(str(patient.get('obra_social', '')))}
 
 🏥 **Estado de Internación:**"""
 
@@ -941,10 +1255,10 @@ Hola {first_name}, {real_data.get('message')}
                 int_data = internacion_vigente
                 response += f"""
 • **Estado:** INTERNADO
-• **Cama:** {int_data.get('cama', 'No especificada')}
-• **Habitación:** {int_data.get('habitacion', 'No especificada')}
-• **Sector:** {int_data.get('sector', 'No especificado')}
-• **Médico Responsable:** {int_data.get('medico_responsable', 'No asignado')}
+• **Cama:** {self._clean_text(str(int_data.get('cama', '')))}
+• **Habitación:** {self._clean_text(str(int_data.get('habitacion', '')))}
+• **Sector:** {self._clean_text(str(int_data.get('sector', '')))}
+• **Médico Responsable:** {self._clean_text(str(int_data.get('medico_responsable', '')))}
 • **Fecha de Ingreso:** {int_data.get('fecha_ingreso', 'No disponible')}
 • **Días Internado:** {int_data.get('dias_internado', 'No calculado')}"""
             else:
@@ -1003,10 +1317,10 @@ Hola {first_name}, {real_data.get('message')}
                 int_data = internacion_vigente
                 response += f"""
 • **Estado:** INTERNADO
-• **Cama:** {int_data.get('cama', 'No especificada')}
-• **Habitación:** {int_data.get('habitacion', 'No especificada')}
-• **Sector:** {int_data.get('sector', 'No especificado')}
-• **Médico Responsable:** {int_data.get('medico_responsable', 'No asignado')}
+• **Cama:** {self._clean_text(str(int_data.get('cama', '')))}
+• **Habitación:** {self._clean_text(str(int_data.get('habitacion', '')))}
+• **Sector:** {self._clean_text(str(int_data.get('sector', '')))}
+• **Médico Responsable:** {self._clean_text(str(int_data.get('medico_responsable', '')))}
 • **Fecha de Ingreso:** {int_data.get('fecha_ingreso', 'No disponible')}
 • **Días Internado:** {int_data.get('dias_internado', 'No calculado')}"""
             else:
@@ -1047,7 +1361,16 @@ Hola {first_name}, {real_data.get('message')}
         """Formatear respuesta completa de estadísticas de camas"""
 
         if not real_data or real_data.get('error'):
-            return f"Hola {first_name}, no pude acceder al estado de camas en este momento. Contacta al 4212121."
+            return f"""⚠️ **Consulta de Camas Temporalmente No Disponible**
+
+Hola {first_name}, no pude acceder al estado actual de camas.
+
+🔄 **Posibles soluciones:**
+• Intentá nuevamente en unos minutos
+• Consultá directamente a Central de Camas: interno 950
+• Llamá a Mesa de Ayuda: 4212121
+
+⏰ **Horario de Consultas:** Lunes a Viernes 8:00 - 18:00"""
 
         # Extraer estadísticas completas
         total_camas = real_data.get('total_camas', 0)
@@ -1131,30 +1454,73 @@ Hola {first_name}, {real_data.get('message')}
     async def _format_volume_response(
         self, user_message: str, query_info: Dict, real_data: Dict, first_name: str
     ) -> str:
-        """Formatear respuesta de volumen de pacientes"""
+        """Formatear respuesta de volumen de pacientes con rangos de fechas y desglose por día"""
 
         if not real_data or real_data.get('error'):
             servicio = query_info.get('servicio', 'el servicio consultado')
-            return f"Hola {first_name}, no pude acceder a los datos de volumen de {servicio}. Contacta al 4212121."
+            return f"""⚠️ **Lo siento {first_name}**
 
-        servicio = real_data.get('servicio', 'Servicio no especificado')
-        periodo = real_data.get('período', 'Período no especificado')
-        turnos_atendidos = real_data.get('total_turnos_atendidos', 0)
-        pacientes_unicos = real_data.get('pacientes_únicos', 0)
+No pude encontrar información de volumen para {servicio}.
 
-        return f"""📊 **VOLUMEN DE PACIENTES ATENDIDOS**
+🔍 **Intentá con:**
+• "volumen de laboratorio del 1 al 15 de octubre"
+• "pacientes atendidos en cardiología esta semana"
+• "cantidad de atendidos en traumatología últimos 30 días"
+• "consultas por servicio entre 01/10/2024 y 15/10/2024"
+
+📞 **Consultas:** 4212121"""
+
+        servicio = real_data.get('servicio', 'Todos los servicios')
+        periodo = real_data.get('periodo', 'período consultado')
+        total_pacientes = real_data.get('total_pacientes_atendidos', 0)
+        total_turnos = real_data.get('total_turnos', 0)
+        estadisticas = real_data.get('estadisticas', {})
+        servicios = real_data.get('servicios', [])
+        desglose_dias = real_data.get('desglose_por_dia', [])
+
+        response = f"""📊 **VOLUMEN DE PACIENTES ATENDIDOS**
 
 🏥 **Servicio:** {servicio}
 📅 **Período:** {periodo}
 
-📈 **Estadísticas:**
-• **Total turnos atendidos:** {turnos_atendidos}
-• **Pacientes únicos:** {pacientes_unicos}
-• **Promedio por paciente:** {round(turnos_atendidos/pacientes_unicos, 1) if pacientes_unicos > 0 else 0} consultas
+📈 **Resumen General:**
+• **Pacientes únicos atendidos:** {total_pacientes}
+• **Total de turnos:** {total_turnos}
+• **Promedio diario:** {estadisticas.get('promedio_diario', 0)} pacientes/día
+• **Días con atención:** {estadisticas.get('dias_con_atencion', 0)}
+"""
+
+        # Mostrar estadísticas por servicio si hay múltiples servicios
+        if len(servicios) > 1:
+            response += "\n🔬 **Por Servicio:**\n"
+            for servicio_info in servicios[:5]:  # Mostrar top 5
+                response += f"• **{servicio_info['nombre']}:** {servicio_info['pacientes_atendidos']} pac. ({servicio_info['total_turnos']} turnos)\n"
+
+            if len(servicios) > 5:
+                response += f"• ... y {len(servicios) - 5} servicios más\n"
+
+        # Mostrar desglose por días si hay pocos días
+        if len(desglose_dias) <= 10 and len(desglose_dias) > 0:
+            response += "\n📅 **Desglose por día:**\n"
+            for dia_info in desglose_dias:
+                fecha_str = dia_info['fecha']
+                # Formatear fecha para mostrar más amigable
+                try:
+                    fecha_obj = datetime.strptime(fecha_str, '%Y-%m-%d')
+                    fecha_formateada = fecha_obj.strftime('%d/%m')
+                except:
+                    fecha_formateada = fecha_str
+
+                response += f"• **{fecha_formateada}:** {dia_info['pacientes_atendidos']} pacientes ({dia_info['total_turnos']} turnos)\n"
+
+        response += f"""
 
 ✅ **Actualizado:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
 🏥 **Hospital Regional Santiago del Estero**
-📞 **Consultas:** 4212121"""
+📞 **Consultas:** 4212121
+*Solo turnos efectivamente atendidos*"""
+
+        return response
 
     async def _format_turnos_response(
         self, user_message: str, query_info: Dict, real_data: Dict, first_name: str
@@ -1205,7 +1571,16 @@ Hola {first_name}, {real_data.get('message')}
 
         if not real_data or real_data.get('error'):
             servicio = query_info.get('servicio', 'el servicio consultado')
-            return f"Hola {first_name}, no pude acceder a los horarios de {servicio}. Contacta al 4212121."
+            return f"""⚠️ **Horarios de {servicio.title()} No Disponibles**
+
+Hola {first_name}, no pude obtener los horarios de {servicio} en este momento.
+
+🔄 **Alternativas:**
+• Probá consultando horarios de otros servicios
+• Llamá directamente al hospital: 4212121
+• Consultá en Mesa de Informes (planta baja)
+
+📞 **Contacto directo:** 4212121 - opción 2 (informes)"""
 
         servicio = real_data.get('servicio', 'Servicio no especificado')
         horarios = real_data.get('horarios', [])
@@ -1398,6 +1773,50 @@ Genera una respuesta útil y profesional."""
         except Exception as e:
             logger.error(f"❌ Error en fallback: {e}")
             return f"Hola {first_name}, tengo problemas técnicos. Llama al 4212121.", 0.1, "error"
+
+    def get_workflow_info(self) -> Dict[str, Any]:
+        """Obtener información del workflow de LangGraph"""
+        try:
+            return {
+                "workflow_available": self.workflow is not None,
+                "groq_model": "llama-3.1-8b-instant",
+                "redis_connected": self.redis is not None,
+                "hospital_data_service": self.hospital_data_service is not None,
+                "status": "functional"
+            }
+        except Exception as e:
+            return {
+                "workflow_available": False,
+                "error": str(e),
+                "status": "error"
+            }
+
+    async def test_workflow(self, test_message: str = "test") -> Dict[str, Any]:
+        """Probar el workflow de LangGraph con un mensaje de prueba"""
+        try:
+            if not self.llm:
+                return {
+                    "success": False,
+                    "error": "LLM not available - API key required",
+                    "status": "error"
+                }
+
+            # Probar conexión básica del LLM
+            test_response = await self.llm.ainvoke("Hello, respond with 'OK' if working")
+
+            return {
+                "success": True,
+                "test_message": test_message,
+                "llm_response": str(test_response.content)[:100] if hasattr(test_response, 'content') else str(test_response)[:100],
+                "groq_model": "llama-3.1-8b-instant",
+                "status": "functional"
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "status": "error"
+            }
 
 
 # ===============================================

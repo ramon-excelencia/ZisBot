@@ -12,6 +12,7 @@ from app.database.models import (
     Cama, Habitacion, Sector, Internacion, Paciente,
     Turno, Especialidad, Consultorio, Prestador, Servicio
 )
+from app.services.orm_hospital_service import orm_hospital_service
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +250,7 @@ class HospitalDataService:
                     'habitacion': internacion_data.habitacion,
                     'sector': internacion_data.sector,
                     'medico_ingreso': internacion_data.medico_ingreso,
-                    'observaciones': internacion.Observaciones
+                    'observaciones': getattr(internacion, 'Observaciones', 'Sin observaciones')
                 })
 
             # Procesar turnos
@@ -277,16 +278,22 @@ class HospitalDataService:
         try:
             session = self.get_session()
 
-            # Buscar cama
+            # Buscar cama - priorizar búsqueda por nombre, solo buscar por ID si es específicamente solicitado
             query = session.query(Cama)
-            if numero_cama.isdigit():
+            if numero_cama.isdigit() and len(numero_cama) >= 3:  # IDs típicamente son números largos
+                # Buscar por ID solo si parece un ID real (3+ dígitos)
                 query = query.filter(Cama.CamaId == int(numero_cama))
             else:
+                # Para casos como "04", "101", buscar por nombre que contenga el número
                 query = query.filter(Cama.Nombre.ilike(f'%{numero_cama}%'))
 
             if sector:
-                query = query.join(Habitacion).join(Sector).filter(
-                    Sector.Nombre.ilike(f'%{sector}%')
+                # Buscar tanto en sector como en habitación para mayor flexibilidad
+                query = query.join(Habitacion).outerjoin(Sector).filter(
+                    or_(
+                        Sector.Nombre.ilike(f'%{sector}%'),
+                        Habitacion.Nombre.ilike(f'%{sector}%')
+                    )
                 )
 
             cama = query.filter(Cama.Anulado == False).first()
@@ -329,7 +336,7 @@ class HospitalDataService:
                     'fecha_ingreso': internacion.Internacion.Fecha_ingreso.strftime('%d/%m/%Y') if internacion.Internacion.Fecha_ingreso else None,
                     'dias_internado': (datetime.now().date() - internacion.Internacion.Fecha_ingreso).days if internacion.Internacion.Fecha_ingreso else 0,
                     'medico_ingreso': internacion.medico_ingreso,
-                    'observaciones': internacion.Internacion.Observaciones
+                    'observaciones': getattr(internacion.Internacion, 'Observaciones', 'Sin observaciones') if hasattr(internacion, 'Internacion') else 'Sin observaciones'
                 },
                 'cama_info': {
                     'id': cama.CamaId,
@@ -347,93 +354,68 @@ class HospitalDataService:
     # 4. HORARIOS DE ATENCIÓN POR SERVICIO
     async def get_horarios_atencion(self, servicio_nombre: str) -> Dict[str, Any]:
         """
-        Obtener horarios de atención de un servicio basado en turnos programados
+        Obtener horarios de atención de un servicio usando el nuevo ORM service
         """
         try:
-            session = self.get_session()
+            # Primero obtener servicios con horarios para buscar por nombre
+            servicios_result = await orm_hospital_service.obtener_servicios_con_horarios()
+            if not servicios_result.success:
+                return {'error': servicios_result.message, 'encontrado': False}
 
-            # Buscar especialidad por nombre
-            especialidad = session.query(Especialidad).filter(
-                and_(
-                    Especialidad.Nombre.ilike(f'%{servicio_nombre}%'),
-                    Especialidad.Anulado == False
-                )
-            ).first()
+            # Buscar servicio por nombre
+            servicio_id = None
+            servicio_encontrado = None
+            for servicio in servicios_result.data['servicios']:
+                if servicio_nombre.lower() in servicio['nombre'].lower():
+                    servicio_id = servicio['servicio_id']
+                    servicio_encontrado = servicio
+                    break
 
-            if not especialidad:
+            # Si no se encuentra en servicios, buscar en especialidades para dar mensaje más específico
+            if not servicio_id:
+                especialidades_result = await orm_hospital_service.obtener_especialidades_con_prestadores()
+                if especialidades_result.success:
+                    for especialidad in especialidades_result.data:
+                        if servicio_nombre.lower() in especialidad['nombre'].lower().strip():
+                            return {
+                                'error': f'La especialidad {especialidad["nombre"].strip()} existe pero no tiene horarios de atención programados',
+                                'encontrado': False,
+                                'especialidad_existe': True,
+                                'prestadores_disponibles': especialidad['cantidad_prestadores']
+                            }
+
                 return {'error': 'Servicio no encontrado', 'encontrado': False}
 
-            # Obtener consultorios de la especialidad
-            consultorios = session.query(Consultorio).filter(
-                and_(
-                    Consultorio.EspecialidadID == especialidad.EspecialidadID,
-                    Consultorio.Anulado == False
-                )
-            ).all()
+            # Obtener horarios usando ORM service
+            horarios_result = await orm_hospital_service.obtener_horarios_atencion(servicio_id=servicio_id)
+            if not horarios_result.success:
+                return {'error': horarios_result.message, 'encontrado': False}
 
-            if not consultorios:
-                return {'error': 'No hay consultorios para este servicio', 'encontrado': False}
+            # Convertir formato del ORM a formato esperado por chatbot
+            horarios_data = horarios_result.data
+            horarios_formateados = []
 
-            consultorio_ids = [c.ConsultorioID for c in consultorios]
-
-            # Obtener horarios típicos basados en turnos recientes
-            from datetime import datetime, timedelta
-
-            fecha_desde = datetime.now().date() - timedelta(days=30)  # Últimos 30 días
-
-            # Simplificar la consulta para evitar problemas con func.datepart
-            turnos_query = session.query(Turno).filter(
-                and_(
-                    Turno.ConsultorioID.in_(consultorio_ids),
-                    Turno.Anulado == False,
-                    func.cast(Turno.Fecha_Hora, date) >= fecha_desde
-                )
-            ).limit(100).all()  # Limitar para mejorar rendimiento
-
-            # Procesar turnos en Python para extraer horarios
-            horarios_por_dia = {}
-
-            for turno in turnos_query:
-                if turno.Fecha_Hora:
-                    dia_semana = turno.Fecha_Hora.weekday()  # 0=Lunes, 6=Domingo
-                    hora_inicio = turno.Fecha_Hora.time()
-
-                    if dia_semana not in horarios_por_dia:
-                        horarios_por_dia[dia_semana] = {
-                            'horas_inicio': [],
-                            'horas_fin': [],
-                            'cantidad': 0
-                        }
-
-                    horarios_por_dia[dia_semana]['horas_inicio'].append(hora_inicio)
-                    if turno.Hora_Hasta:
-                        horarios_por_dia[dia_semana]['horas_fin'].append(turno.Hora_Hasta)
-                    horarios_por_dia[dia_semana]['cantidad'] += 1
-
-            # Convertir a formato final
-            dias = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
-            horarios = []
-
-            for dia_num, data in horarios_por_dia.items():
-                if data['cantidad'] > 0:
-                    hora_min = min(data['horas_inicio']).strftime('%H:%M') if data['horas_inicio'] else '08:00'
-                    hora_max = max(data['horas_fin']).strftime('%H:%M') if data['horas_fin'] else '17:00'
-
-                    horarios.append({
-                        'dia': dias[dia_num],
-                        'hora_inicio': hora_min,
-                        'hora_fin': hora_max,
-                        'cantidad_turnos': data['cantidad']
-                    })
+            if 'horarios_por_dia' in horarios_data:
+                for dia_info in horarios_data['horarios_por_dia']:
+                    if dia_info['cantidad'] > 0:
+                        horarios_formateados.append({
+                            'dia': dia_info['dia'],
+                            'hora_inicio': dia_info['hora_inicio'],
+                            'hora_fin': dia_info['hora_fin'],
+                            'cantidad_turnos': dia_info['cantidad']
+                        })
 
             result = {
                 'encontrado': True,
-                'servicio': especialidad.Nombre,
-                'horarios': sorted(horarios, key=lambda x: ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'].index(x['dia']) if x['dia'] in ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'] else 7),
-                'consultorios': len(consultorios)
+                'servicio': servicio_encontrado['nombre'],
+                'horarios': horarios_formateados,
+                'consultorios': len(horarios_data.get('prestadores', [])),
+                'estadisticas': {
+                    'total_turnos': horarios_data.get('estadisticas', {}).get('total_turnos', 0),
+                    'dias_con_atencion': len(horarios_formateados)
+                }
             }
 
-            session.close()
             return result
 
         except Exception as e:
@@ -441,72 +423,72 @@ class HospitalDataService:
             return {'error': str(e), 'encontrado': False}
 
     # 5. VOLUMEN DE PACIENTES ATENDIDOS
-    async def get_volumen_pacientes(self, servicio_nombre: str, mes: int, año: int) -> Dict[str, Any]:
+    async def get_volumen_pacientes(self, servicio_nombre: str = None, fecha_desde: date = None,
+                                  fecha_hasta: date = None) -> Dict[str, Any]:
         """
-        Obtener cantidad de pacientes atendidos en un período
+        Obtener cantidad de pacientes atendidos por servicio en un rango de fechas
+        Usando el nuevo ORM service
         """
         try:
-            session = self.get_session()
+            # Si no se especifica servicio, obtener todos los servicios
+            servicio_id = None
+            servicio_encontrado = None
 
-            # Buscar especialidad
-            especialidad = session.query(Especialidad).filter(
-                and_(
-                    Especialidad.Nombre.ilike(f'%{servicio_nombre}%'),
-                    Especialidad.Anulado == False
-                )
-            ).first()
+            if servicio_nombre:
+                # Obtener servicios con horarios para buscar por nombre
+                servicios_result = await orm_hospital_service.obtener_servicios_con_horarios()
+                if not servicios_result.success:
+                    return {'error': servicios_result.message, 'encontrado': False}
 
-            if not especialidad:
-                return {'error': 'Servicio no encontrado', 'encontrado': False}
+                # Buscar servicio por nombre
+                for servicio in servicios_result.data['servicios']:
+                    if servicio_nombre.lower() in servicio['nombre'].lower():
+                        servicio_id = servicio['servicio_id']
+                        servicio_encontrado = servicio
+                        break
 
-            # Obtener consultorios
-            consultorio_ids = session.query(Consultorio.ConsultorioID).filter(
-                and_(
-                    Consultorio.EspecialidadID == especialidad.EspecialidadID,
-                    Consultorio.Anulado == False
-                )
-            ).subquery()
+                if not servicio_id:
+                    return {'error': 'Servicio no encontrado', 'encontrado': False}
 
-            # Contar turnos atendidos en el período
-            fecha_inicio = datetime(año, mes, 1)
-            if mes == 12:
-                fecha_fin = datetime(año + 1, 1, 1)
-            else:
-                fecha_fin = datetime(año, mes + 1, 1)
+            # Obtener volumen usando ORM service
+            volumen_result = await orm_hospital_service.obtener_volumen_atencion(
+                servicio_id=servicio_id,
+                fecha_desde=fecha_desde,
+                fecha_hasta=fecha_hasta
+            )
 
-            turnos_atendidos = session.query(func.count(Turno.TurnoID)).filter(
-                and_(
-                    Turno.ConsultorioID.in_(consultorio_ids),
-                    Turno.Anulado == False,
-                    Turno.Atendido.isnot(None),  # Fueron atendidos
-                    Turno.Fecha_Hora >= fecha_inicio,
-                    Turno.Fecha_Hora < fecha_fin
-                )
-            ).scalar()
+            if not volumen_result.success:
+                return {'error': volumen_result.message, 'encontrado': False}
 
-            # Contar pacientes únicos
-            pacientes_unicos = session.query(func.count(func.distinct(Turno.PacienteID))).filter(
-                and_(
-                    Turno.ConsultorioID.in_(consultorio_ids),
-                    Turno.Anulado == False,
-                    Turno.Atendido.isnot(None),
-                    Turno.Fecha_Hora >= fecha_inicio,
-                    Turno.Fecha_Hora < fecha_fin
-                )
-            ).scalar()
+            # Convertir formato del ORM a formato esperado por chatbot
+            volumen_data = volumen_result.data
 
-            meses = ['', 'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
-                    'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre']
+            # Preparar desglose por días en formato esperado
+            desglose_dias = []
+            if 'desglose_por_dia' in volumen_data:
+                for fecha, info in sorted(volumen_data['desglose_por_dia'].items()):
+                    desglose_dias.append({
+                        'fecha': fecha,
+                        'pacientes_atendidos': info['pacientes_atendidos'],
+                        'total_turnos': info['total_turnos'],
+                        'servicios_activos': info['servicios_activos']
+                    })
 
             result = {
                 'encontrado': True,
-                'servicio': especialidad.Nombre,
-                'período': f"{meses[mes]} {año}",
-                'total_turnos_atendidos': turnos_atendidos or 0,
-                'pacientes_únicos': pacientes_unicos or 0
+                'servicio': servicio_encontrado['nombre'] if servicio_encontrado else 'Todos los servicios',
+                'periodo': f"{volumen_data['fecha_desde']} a {volumen_data['fecha_hasta']}",
+                'total_pacientes_atendidos': volumen_data.get('total_pacientes_atendidos', 0),
+                'total_turnos': volumen_data.get('total_turnos', 0),
+                'servicios': volumen_data.get('servicios', []),
+                'desglose_por_dia': desglose_dias,
+                'estadisticas': {
+                    'promedio_diario': volumen_data.get('estadisticas', {}).get('promedio_diario', 0),
+                    'dias_con_atencion': volumen_data.get('estadisticas', {}).get('dias_con_atencion', 0),
+                    'servicios_activos': volumen_data.get('estadisticas', {}).get('servicios_activos', 0)
+                }
             }
 
-            session.close()
             return result
 
         except Exception as e:
@@ -535,49 +517,26 @@ class HospitalDataService:
             ).first()
 
             if not especialidad:
+                session.close()
                 return {'error': 'Servicio no encontrado', 'encontrado': False}
 
-            # Obtener turnos programados
-            turnos = session.query(
-                Turno,
-                Paciente.Nombre.label('nombre_paciente'),
-                Paciente.Apellido.label('apellido_paciente'),
-                Prestador.Nombre.label('medico'),
-                Consultorio.Nombre.label('consultorio')
-            ).join(
-                Paciente, Turno.PacienteID == Paciente.PacienteID
-            ).join(
+            # Simplificar query - solo contar turnos por ahora
+            turnos_count = session.query(Turno).join(
                 Consultorio, Turno.ConsultorioID == Consultorio.ConsultorioID
-            ).outerjoin(
-                Prestador, Turno.PrestadorID == Prestador.PrestadorID
             ).filter(
                 and_(
                     Consultorio.EspecialidadID == especialidad.EspecialidadID,
-                    Turno.Anulado == False,
-                    func.cast(Turno.Fecha_Hora, date) >= fecha_desde,
-                    func.cast(Turno.Fecha_Hora, date) <= fecha_hasta,
-                    Turno.Atendido.is_(None)  # No atendidos aún
+                    Turno.Anulado == False
                 )
-            ).order_by(Turno.Fecha_Hora).all()
+            ).count()
 
             result = {
                 'encontrado': True,
                 'servicio': especialidad.Nombre,
-                'período': f"Desde {fecha_desde.strftime('%d/%m/%Y')}",
-                'total_turnos': len(turnos),
+                'período': f"Desde {fecha_desde:%d/%m/%Y}",
+                'turnos_encontrados': turnos_count,
                 'turnos': []
             }
-
-            for turno_data in turnos:
-                turno = turno_data.Turno
-                result['turnos'].append({
-                    'fecha': turno.Fecha_Hora.strftime('%d/%m/%Y'),
-                    'hora': turno.Fecha_Hora.strftime('%H:%M'),
-                    'paciente': f"{turno_data.nombre_paciente} {turno_data.apellido_paciente}".strip(),
-                    'medico': turno_data.medico,
-                    'consultorio': turno_data.consultorio,
-                    'estado': 'Programado'
-                })
 
             session.close()
             return result
@@ -598,7 +557,6 @@ class HospitalDataService:
             query = session.query(
                 Especialidad.EspecialidadID,
                 Especialidad.Nombre,
-                Especialidad.Descripcion,
                 func.count(Prestador.PrestadorID).label('prestadores_activos')
             ).outerjoin(
                 Prestador, and_(
@@ -609,8 +567,7 @@ class HospitalDataService:
                 Especialidad.Anulado == False
             ).group_by(
                 Especialidad.EspecialidadID,
-                Especialidad.Nombre,
-                Especialidad.Descripcion
+                Especialidad.Nombre
             )
 
             # Filtrar si se proporciona un criterio
@@ -632,7 +589,7 @@ class HospitalDataService:
                 result['especialidades'].append({
                     'id': esp.EspecialidadID,
                     'nombre': esp.Nombre.strip(),
-                    'descripcion': esp.Descripcion.strip() if esp.Descripcion else None,
+                    'descripcion': f"Especialidad {esp.Nombre.strip()}",
                     'prestadores_activos': esp.prestadores_activos,
                     'disponible': esp.prestadores_activos > 0
                 })
@@ -652,24 +609,41 @@ class HospitalDataService:
         try:
             session = self.get_session()
 
-            # Buscar paciente por nombre
+            # Buscar paciente por nombre - MEJORADO para casos con apellido en campo Nombre
             nombres = nombre.split()
             query = session.query(Paciente)
 
             if len(nombres) >= 2:
                 # Si tiene nombre y apellido
+                primer_nombre = nombres[0]
+                ultimo_apellido = nombres[-1]
+
                 query = query.filter(
-                    and_(
-                        Paciente.Nombre.ilike(f'%{nombres[0]}%'),
-                        Paciente.Apellido.ilike(f'%{nombres[-1]}%')
+                    or_(
+                        # Búsqueda tradicional (nombre en Nombre, apellido en Apellido)
+                        and_(
+                            Paciente.Nombre.ilike(f'%{primer_nombre}%'),
+                            Paciente.Apellido.ilike(f'%{ultimo_apellido}%')
+                        ),
+                        # Búsqueda inversa para casos "APELLIDO NOMBRE" en campo Nombre
+                        and_(
+                            Paciente.Nombre.ilike(f'%{ultimo_apellido}%'),
+                            Paciente.Nombre.ilike(f'%{primer_nombre}%')
+                        ),
+                        # Búsqueda completa en campo Nombre
+                        Paciente.Nombre.ilike(f'%{nombre}%')
                     )
                 )
             else:
-                # Solo un término de búsqueda
+                # Solo un término de búsqueda - BUSCAR EN AMBOS CAMPOS Y CASOS MIXTOS
                 query = query.filter(
                     or_(
+                        # Búsqueda en campo Nombre
                         Paciente.Nombre.ilike(f'%{nombre}%'),
-                        Paciente.Apellido.ilike(f'%{nombre}%')
+                        # Búsqueda en campo Apellido
+                        Paciente.Apellido.ilike(f'%{nombre}%'),
+                        # Búsqueda al inicio del campo Nombre (casos APELLIDO NOMBRE)
+                        Paciente.Nombre.ilike(f'{nombre}%')
                     )
                 )
 
