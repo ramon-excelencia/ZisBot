@@ -11,12 +11,21 @@ import urllib.parse
 
 logger = logging.getLogger(__name__)
 
-# Configuración de la base de datos
+# Configuración de la base de datos - PRODUCCIÓN ZISMED
 DB_CONFIG = {
-    'server': '168.226.219.57,2424',
+    'server': '172.16.30.1',
     'database': 'DBH_Test',
-    'username': 'sa',
-    'password': 'Excel159753',
+    'username': 'Zismed',
+    'password': 'donJuane2e',
+    'driver': 'ODBC Driver 17 for SQL Server'
+}
+
+# Configuración secundaria para HCWeb (integración)
+DB_CONFIG_HCWEB = {
+    'server': '172.16.30.1',
+    'database': 'TurnosHistoriaClinicaWeb',
+    'username': 'usrProduccion',
+    'password': 'C@picua2018',
     'driver': 'ODBC Driver 17 for SQL Server'
 }
 

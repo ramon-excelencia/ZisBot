@@ -379,24 +379,13 @@ class ChatbotService:
                 'fecha': fecha
             }
 
-        # 5. TURNOS PROGRAMADOS
-        turnos_keywords = ['turnos', 'agenda', 'programados', 'citas', 'consultas']
-        turnos_phrases = ['turnos para', 'turnos de', 'cuantos turnos', 'turnos disponibles', 'agenda de', 'horarios de']
-
-        if (any(word in message_lower for word in turnos_keywords) or
-            any(phrase in message_lower for phrase in turnos_phrases)):
-            servicio = self._extract_service_name(message_lower)
-            logger.info(f"📅 DETECTADO: turnos_programados, servicio: {servicio}")
-            return {
-                'type': 'turnos_programados',
-                'servicio': servicio
-            }
-
-        # 5. HORARIOS DE ATENCIÓN
+        # 5. HORARIOS DE ATENCIÓN (PRIORIDAD ANTES QUE TURNOS)
         horario_keywords = ['horarios', 'atencion', 'horario', 'cuando atiende', 'que horario', 'a que hora']
+        horario_phrases = ['horarios de', 'horario de', 'horarios atencion', 'cuando atiende']
         medico_patterns = ['dr ', 'dra ', 'doctor ', 'doctora ']
 
-        if any(word in message_lower for word in horario_keywords):
+        if (any(word in message_lower for word in horario_keywords) or
+            any(phrase in message_lower for phrase in horario_phrases)):
             servicio = self._extract_service_name(message_lower)
             medico = None
 
@@ -414,6 +403,19 @@ class ChatbotService:
                 'type': 'horarios_atencion',
                 'servicio': servicio,
                 'medico': medico
+            }
+
+        # 5.2 TURNOS PROGRAMADOS
+        turnos_keywords = ['turnos', 'agenda', 'programados', 'citas', 'consultas']
+        turnos_phrases = ['turnos para', 'turnos de', 'cuantos turnos', 'turnos disponibles', 'agenda de']
+
+        if (any(word in message_lower for word in turnos_keywords) or
+            any(phrase in message_lower for phrase in turnos_phrases)):
+            servicio = self._extract_service_name(message_lower)
+            logger.info(f"📅 DETECTADO: turnos_programados, servicio: {servicio}")
+            return {
+                'type': 'turnos_programados',
+                'servicio': servicio
             }
 
         # 5.5 ESPECIALIDADES - PRIORIDAD ALTA (antes que camas)
