@@ -6,7 +6,7 @@ import axios from 'axios'
 
 // Configuración base de Axios
 const api = axios.create({
-  baseURL: 'http://localhost:8009/api',
+  baseURL: 'http://localhost:8008/api',
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json',

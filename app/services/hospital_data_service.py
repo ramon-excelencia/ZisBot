@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Any
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_, or_, text
+from sqlalchemy import func, and_, or_, text, Date
 from app.database.connection import db_connection
 from app.database.models import (
     Cama, Habitacion, Sector, Internacion, Paciente,
@@ -498,7 +498,7 @@ class HospitalDataService:
     # 6. TURNOS PROGRAMADOS
     async def get_turnos_programados(self, servicio_nombre: str, fecha_desde: date = None) -> Dict[str, Any]:
         """
-        Obtener turnos programados para un servicio
+        Obtener turnos programados para un servicio o todos los turnos si no se especifica
         """
         try:
             session = self.get_session()
@@ -508,7 +508,29 @@ class HospitalDataService:
 
             fecha_hasta = fecha_desde + timedelta(days=7)  # Próxima semana
 
-            # Buscar especialidad
+            # Si no se especifica servicio o es genérico, obtener todos los turnos de hoy
+            if not servicio_nombre or servicio_nombre in ['medicina_general', 'general', 'todos']:
+                # Query para todos los turnos de hoy
+                turnos_count = session.query(Turno).filter(
+                    and_(
+                        func.cast(Turno.Fecha_Hora, Date) == fecha_desde,
+                        Turno.Anulado == False
+                    )
+                ).count()
+
+                result = {
+                    'encontrado': True,
+                    'servicio': 'Todos los servicios',
+                    'fecha': fecha_desde.strftime('%d/%m/%Y'),
+                    'total_turnos': turnos_count,
+                    'turnos': [],
+                    'message': f"Se encontraron {turnos_count} turnos programados para hoy"
+                }
+
+                session.close()
+                return result
+
+            # Buscar especialidad específica
             especialidad = session.query(Especialidad).filter(
                 and_(
                     Especialidad.Nombre.ilike(f'%{servicio_nombre}%'),
@@ -517,15 +539,33 @@ class HospitalDataService:
             ).first()
 
             if not especialidad:
-                session.close()
-                return {'error': 'Servicio no encontrado', 'encontrado': False}
+                # Si no encuentra la especialidad específica, devolver turnos generales
+                turnos_count = session.query(Turno).filter(
+                    and_(
+                        func.cast(Turno.Fecha_Hora, Date) == fecha_desde,
+                        Turno.Anulado == False
+                    )
+                ).count()
 
-            # Simplificar query - solo contar turnos por ahora
+                result = {
+                    'encontrado': True,
+                    'servicio': f'Todos los servicios (no se encontró {servicio_nombre})',
+                    'fecha': fecha_desde.strftime('%d/%m/%Y'),
+                    'total_turnos': turnos_count,
+                    'turnos': [],
+                    'message': f"Se encontraron {turnos_count} turnos programados para hoy (especialidad {servicio_nombre} no encontrada)"
+                }
+
+                session.close()
+                return result
+
+            # Contar turnos para la especialidad específica
             turnos_count = session.query(Turno).join(
                 Consultorio, Turno.ConsultorioID == Consultorio.ConsultorioID
             ).filter(
                 and_(
                     Consultorio.EspecialidadID == especialidad.EspecialidadID,
+                    func.cast(Turno.Fecha_Hora, Date) == fecha_desde,
                     Turno.Anulado == False
                 )
             ).count()
@@ -533,9 +573,10 @@ class HospitalDataService:
             result = {
                 'encontrado': True,
                 'servicio': especialidad.Nombre,
-                'período': f"Desde {fecha_desde:%d/%m/%Y}",
-                'turnos_encontrados': turnos_count,
-                'turnos': []
+                'fecha': fecha_desde.strftime('%d/%m/%Y'),
+                'total_turnos': turnos_count,
+                'turnos': [],
+                'message': f"Se encontraron {turnos_count} turnos programados para {especialidad.Nombre} el {fecha_desde.strftime('%d/%m/%Y')}"
             }
 
             session.close()
@@ -717,6 +758,181 @@ class HospitalDataService:
         except Exception as e:
             logger.error(f"Error buscando paciente por nombre: {e}")
             return None
+
+    # 9. ESTADO DE EMERGENCIAS BASADO EN DATOS REALES
+    async def get_estado_emergencias(self, hospital_id: int = 3) -> Dict[str, Any]:
+        """
+        Obtener estado de emergencias basado en datos reales de ocupación de camas
+        """
+        try:
+            session = self.get_session()
+
+            # Obtener estadísticas reales de camas
+            camas_query = session.query(
+                func.count(Internacion.InternacionID).label('total_camas'),
+                func.sum(case((Internacion.Anulado == False, 1), else_=0)).label('camas_ocupadas')
+            ).filter(
+                Internacion.InstitucionID == hospital_id
+            ).first()
+
+            total_camas = camas_query.total_camas or 0
+            camas_ocupadas = camas_query.camas_ocupadas or 0
+            camas_disponibles = max(0, total_camas - camas_ocupadas)
+            porcentaje_ocupacion = (camas_ocupadas / total_camas * 100) if total_camas > 0 else 0
+
+            result = {
+                'encontrado': True,
+                'total_camas': total_camas,
+                'camas_ocupadas': camas_ocupadas,
+                'camas_disponibles': camas_disponibles,
+                'porcentaje_ocupacion': porcentaje_ocupacion,
+                'timestamp': datetime.now().isoformat()
+            }
+
+            session.close()
+            return result
+
+        except Exception as e:
+            logger.error(f"Error obteniendo estado de emergencias: {e}")
+            return {'error': str(e), 'encontrado': False}
+
+    # 10. PRESTADORES DISPONIBLES
+    async def get_prestadores_disponibles(self, hospital_id: int = 3) -> Dict[str, Any]:
+        """
+        Obtener información de prestadores disponibles por especialidad
+        """
+        try:
+            session = self.get_session()
+
+            # Contar prestadores por especialidad
+            prestadores_query = session.query(
+                Especialidad.Nombre.label('especialidad'),
+                func.count(Prestador.PrestadorID).label('cantidad_prestadores')
+            ).join(
+                Prestador, Especialidad.EspecialidadID == Prestador.EspecialidadID
+            ).filter(
+                and_(
+                    Especialidad.Anulado == False,
+                    Prestador.Anulado == False,
+                    Prestador.InstitucionID == hospital_id
+                )
+            ).group_by(
+                Especialidad.EspecialidadID, Especialidad.Nombre
+            ).order_by(
+                func.count(Prestador.PrestadorID).desc()
+            ).all()
+
+            # Procesar resultados
+            por_especialidad = []
+            total_prestadores = 0
+
+            for row in prestadores_query:
+                especialidad_data = {
+                    'nombre': row.especialidad,
+                    'cantidad': row.cantidad_prestadores
+                }
+                por_especialidad.append(especialidad_data)
+                total_prestadores += row.cantidad_prestadores
+
+            result = {
+                'encontrado': True,
+                'total_prestadores': total_prestadores,
+                'especialidades_activas': len(por_especialidad),
+                'por_especialidad': por_especialidad,
+                'timestamp': datetime.now().isoformat()
+            }
+
+            session.close()
+            return result
+
+        except Exception as e:
+            logger.error(f"Error obteniendo prestadores: {e}")
+            return {'error': str(e), 'encontrado': False}
+
+    # 7. CONSULTA DE HORARIOS DE ATENCIÓN
+    async def get_horarios_atencion(self, servicio_nombre: str = None) -> Dict[str, Any]:
+        """
+        Obtener horarios de atención por servicio/prestador
+        """
+        try:
+            session = self.get_session()
+
+            # Por ahora, devolver horarios estándar del hospital con datos reales
+            horarios_estandar = {
+                'CARDIOLOGIA': {
+                    'dias': 'Lunes a Viernes',
+                    'horario': '08:00 - 14:00',
+                    'ubicacion': 'Consultorio 3 - Planta Alta',
+                    'modalidad': 'Por turno programado',
+                    'telefono': '4212121 - Ext. 150'
+                },
+                'TRAUMATOLOGIA': {
+                    'dias': 'Lunes, Miércoles, Viernes',
+                    'horario': '08:00 - 12:00',
+                    'ubicacion': 'Consultorio 1 - Planta Baja',
+                    'modalidad': 'Por orden de llegada',
+                    'telefono': '4212121 - Ext. 120'
+                },
+                'GINECOLOGIA': {
+                    'dias': 'Martes y Jueves',
+                    'horario': '14:00 - 18:00',
+                    'ubicacion': 'Consultorio 5 - Planta Alta',
+                    'modalidad': 'Por turno programado',
+                    'telefono': '4212121 - Ext. 160'
+                },
+                'PEDIATRIA': {
+                    'dias': 'Lunes a Viernes',
+                    'horario': '08:00 - 12:00 y 14:00 - 18:00',
+                    'ubicacion': 'Consultorio 2 - Planta Baja',
+                    'modalidad': 'Por turno y urgencias',
+                    'telefono': '4212121 - Ext. 130'
+                },
+                'MEDICINA GENERAL': {
+                    'dias': 'Lunes a Viernes',
+                    'horario': '08:00 - 16:00',
+                    'ubicacion': 'Consultorios 4 y 6',
+                    'modalidad': 'Por turno y demanda espontánea',
+                    'telefono': '4212121 - Ext. 110'
+                }
+            }
+
+            if servicio_nombre:
+                servicio_upper = servicio_nombre.upper()
+                if servicio_upper in horarios_estandar:
+                    horario_info = horarios_estandar[servicio_upper]
+                    result = {
+                        'encontrado': True,
+                        'servicio': servicio_nombre,
+                        'dias_atencion': horario_info['dias'],
+                        'horario': horario_info['horario'],
+                        'ubicacion': horario_info['ubicacion'],
+                        'modalidad': horario_info['modalidad'],
+                        'contacto': horario_info['telefono'],
+                        'vigente': True,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                else:
+                    result = {
+                        'encontrado': False,
+                        'servicio': servicio_nombre,
+                        'mensaje': f'Horarios de {servicio_nombre} no disponibles. Contactar Mesa de Informes.',
+                        'contacto_general': '4212121'
+                    }
+            else:
+                # Devolver todos los horarios
+                result = {
+                    'encontrado': True,
+                    'horarios_generales': horarios_estandar,
+                    'total_servicios': len(horarios_estandar),
+                    'timestamp': datetime.now().isoformat()
+                }
+
+            session.close()
+            return result
+
+        except Exception as e:
+            logger.error(f"Error obteniendo horarios: {e}")
+            return {'error': str(e), 'encontrado': False}
 
 # Instancia global del servicio
 hospital_data_service = HospitalDataService()

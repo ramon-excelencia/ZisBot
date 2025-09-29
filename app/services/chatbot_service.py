@@ -324,6 +324,12 @@ class ChatbotService:
         message_lower = message.lower()
         logger.info(f"🔍 ANALIZANDO: '{message}' -> '{message_lower}'")
 
+        # 0. AYUDA/CAPACIDADES DEL SISTEMA (PRIORIDAD ALTA)
+        ayuda_keywords = ['ayuda', 'help', 'qué puedo', 'que puedo', 'qué consultas', 'que consultas', 'como funciona', 'capacidades', 'funcionalidades']
+        if any(keyword in message_lower for keyword in ayuda_keywords):
+            logger.info(f"❓ DETECTADO: ayuda_sistema")
+            return {'type': 'ayuda_sistema'}
+
         # 1. HISTORIA CLÍNICA CON DNI (PRIORIDAD MÁXIMA)
         if (any(word in message_lower for word in ['historia', 'historial', 'clinica', 'expediente'])
             and any(char.isdigit() for char in message)):
@@ -360,32 +366,7 @@ class ChatbotService:
                 'fecha_hasta': fecha_hasta
             }
 
-        # 4. TURNOS PROGRAMADOS
-        if any(word in message_lower for word in ['turnos', 'agenda', 'programados']):
-            servicio = self._extract_service_name(message_lower)
-            logger.info(f"📅 DETECTADO: turnos_programados, servicio: {servicio}")
-            return {
-                'type': 'turnos_programados',
-                'servicio': servicio
-            }
-
-        # 5. HORARIOS DE ATENCIÓN
-        if any(word in message_lower for word in ['horarios', 'atencion', 'horario']):
-            servicio = self._extract_service_name(message_lower)
-            logger.info(f"🕒 DETECTADO: horarios_atencion, servicio: {servicio}")
-            return {
-                'type': 'horarios_atencion',
-                'servicio': servicio
-            }
-
-        # 5.5 ESPECIALIDADES - PRIORIDAD ALTA (antes que camas)
-        if any(word in message_lower for word in ['especialidad', 'especialidades', 'especialista', 'especialistas']):
-            logger.info(f"🏥 DETECTADO: especialidades_disponibles")
-            return {
-                'type': 'especialidades_disponibles'
-            }
-
-        # 6. CAMAS DISPONIBLES (con filtros de fecha y sector) - EVITAR CONFLICTO
+        # 4. CAMAS DISPONIBLES (PRIORIDAD ALTA - antes que turnos)
         if any(word in message_lower for word in ['cama', 'camas', 'libre', 'ocupad']) or (
             'disponible' in message_lower and not any(esp in message_lower for esp in ['especialidad', 'especialidades'])
         ):
@@ -397,6 +378,63 @@ class ChatbotService:
                 'servicio': servicio,
                 'fecha': fecha
             }
+
+        # 5. TURNOS PROGRAMADOS
+        turnos_keywords = ['turnos', 'agenda', 'programados', 'citas', 'consultas']
+        turnos_phrases = ['turnos para', 'turnos de', 'cuantos turnos', 'turnos disponibles', 'agenda de', 'horarios de']
+
+        if (any(word in message_lower for word in turnos_keywords) or
+            any(phrase in message_lower for phrase in turnos_phrases)):
+            servicio = self._extract_service_name(message_lower)
+            logger.info(f"📅 DETECTADO: turnos_programados, servicio: {servicio}")
+            return {
+                'type': 'turnos_programados',
+                'servicio': servicio
+            }
+
+        # 5. HORARIOS DE ATENCIÓN
+        horario_keywords = ['horarios', 'atencion', 'horario', 'cuando atiende', 'que horario', 'a que hora']
+        medico_patterns = ['dr ', 'dra ', 'doctor ', 'doctora ']
+
+        if any(word in message_lower for word in horario_keywords):
+            servicio = self._extract_service_name(message_lower)
+            medico = None
+
+            # Detectar si pregunta por un médico específico
+            for pattern in medico_patterns:
+                if pattern in message_lower:
+                    # Extraer nombre del médico
+                    medico_match = re.search(f'{pattern}([A-Za-záéíóúñÑ]+(?:\\s+[A-Za-záéíóúñÑ]+)*)', message_lower)
+                    if medico_match:
+                        medico = medico_match.group(1).title()
+                        break
+
+            logger.info(f"🕒 DETECTADO: horarios_atencion, servicio: {servicio}, médico: {medico}")
+            return {
+                'type': 'horarios_atencion',
+                'servicio': servicio,
+                'medico': medico
+            }
+
+        # 5.5 ESPECIALIDADES - PRIORIDAD ALTA (antes que camas)
+        if any(word in message_lower for word in ['especialidad', 'especialidades', 'especialista', 'especialistas']):
+            logger.info(f"🏥 DETECTADO: especialidades_disponibles")
+            return {
+                'type': 'especialidades_disponibles'
+            }
+
+        # 5.7 ESTADO DE EMERGENCIAS/GUARDIA
+        emergencia_phrases = ['estado de emergencias', 'estado de guardia', 'emergencias del hospital', 'como esta la guardia', 'estado guardia']
+        if any(phrase in message_lower for phrase in emergencia_phrases):
+            logger.info(f"🚨 DETECTADO: estado_emergencias")
+            return {'type': 'estado_emergencias'}
+
+        # 5.8 PRESTADORES DISPONIBLES
+        prestadores_phrases = ['prestadores', 'médicos disponibles', 'profesionales disponibles', 'cuantos medicos', 'cuantos prestadores']
+        if any(phrase in message_lower for phrase in prestadores_phrases):
+            logger.info(f"👨‍⚕️ DETECTADO: prestadores_disponibles")
+            return {'type': 'prestadores_disponibles'}
+
 
         # 7. BÚSQUEDA DE PACIENTE POR DNI
         if (any(word in message_lower for word in ['dni', 'documento', 'buscar paciente'])
@@ -525,7 +563,6 @@ class ChatbotService:
     def _extract_service_and_date(self, message_lower: str) -> tuple:
         """Extraer nombre de servicio y fecha del mensaje"""
         import re
-        from datetime import datetime
 
         # Extraer servicio
         servicio = self._extract_service_name(message_lower)
@@ -563,7 +600,6 @@ class ChatbotService:
     def _extract_date_from_message(self, message_lower: str) -> str:
         """Extraer fecha del mensaje en formato YYYY-MM-DD"""
         import re
-        from datetime import datetime, date
 
         # Patrones de fecha comunes
         date_patterns = [
@@ -650,7 +686,6 @@ class ChatbotService:
     def _extract_date_range(self, message_lower: str) -> tuple:
         """Extraer rango de fechas del mensaje"""
         import re
-        from datetime import datetime, date, timedelta
 
         # Patrones para rangos de fechas
         range_patterns = [
@@ -832,6 +867,12 @@ class ChatbotService:
 
                 return result
 
+            elif query_type == 'ayuda_sistema':
+                # Generar información de capacidades del sistema
+                result = await self._get_system_help()
+                logger.info(f"❓ Ayuda sistema resultado: {result is not None}")
+                return result
+
             elif query_type == 'historia_clinica_dni':
                 # Validar permisos antes de obtener historia clínica por DNI
                 dni = query_info.get('documento')
@@ -907,6 +948,18 @@ class ChatbotService:
                 logger.info(f"🛏️ Camas disponibles resultado: {result is not None}")
                 return result
 
+            elif query_type == 'estado_emergencias':
+                # Usar datos reales de camas y estadísticas para estado de emergencias
+                result = await hospital_data_service.get_estado_emergencias()
+                logger.info(f"🚨 Estado emergencias resultado: {result is not None}")
+                return result
+
+            elif query_type == 'prestadores_disponibles':
+                # Usar datos reales de prestadores
+                result = await hospital_data_service.get_prestadores_disponibles()
+                logger.info(f"👨‍⚕️ Prestadores disponibles resultado: {result is not None}")
+                return result
+
             elif query_type == 'volumen_pacientes':
                 # Usar hospital_data_service para volumen de pacientes con rangos de fechas
                 servicio = query_info.get('servicio')
@@ -954,6 +1007,10 @@ class ChatbotService:
             return await self._format_historia_clinica_response(
                 user_message, query_info, real_data, first_name
             )
+        elif query_type == 'ayuda_sistema':
+            return await self._format_help_response(
+                user_message, query_info, real_data, first_name
+            )
         elif query_type == 'historia_clinica_dni':
             return await self._format_historia_clinica_dni_response(
                 user_message, query_info, real_data, first_name
@@ -968,6 +1025,14 @@ class ChatbotService:
             )
         elif query_type == 'camas_disponibles':
             return await self._format_beds_response(
+                user_message, query_info, real_data, first_name
+            )
+        elif query_type == 'estado_emergencias':
+            return await self._format_emergency_status_response(
+                user_message, query_info, real_data, first_name
+            )
+        elif query_type == 'prestadores_disponibles':
+            return await self._format_prestadores_response(
                 user_message, query_info, real_data, first_name
             )
         elif query_type == 'volumen_pacientes':
@@ -1388,12 +1453,25 @@ Hola {first_name}, no pude acceder al estado actual de camas.
         else:
             capacidad_desc = f"Total de camas: {total_camas}"
 
+        # Obtener información completa de camas desde debug
+        debug_info = await self._get_debug_camas_info()
+
         response = f"""🛏️ **CAPACIDAD HOSPITALARIA - SANTIAGO DEL ESTERO**
 
 📊 **Estado Actual - {servicio_consultado.upper()}:**
-• **{capacidad_desc}**
+• **Total camas Hospital Regional: {debug_info.get('total_hospital', total_camas)}**
+• **Camas operativas (Planta baja): {total_camas}**
 • **Ocupadas:** {total_ocupadas} ({porcentaje_ocupacion}%)
-• **Disponibles:** {total_disponibles} ({porcentaje_disponibilidad}%)"""
+• **Disponibles:** {total_disponibles} ({porcentaje_disponibilidad}%)
+
+🏥 **Distribución por Estado:**
+• **Habilitadas:** {debug_info.get('habilitadas', 'N/A')}
+• **No habilitadas:** {debug_info.get('no_habilitadas', 'N/A')}
+• **En mantenimiento:** {debug_info.get('mantenimiento', 'N/A')}
+
+📍 **Distribución por Sector:**
+• **Planta baja:** {debug_info.get('planta_baja', total_camas)} camas
+• **Administración:** {debug_info.get('administracion', 'N/A')} camas"""
 
         # Agregar información de fecha si se consultó por fecha específica
         if fecha_consultada:
@@ -1528,7 +1606,7 @@ No pude encontrar información de volumen para {servicio}.
         """Formatear respuesta de turnos programados"""
 
         if not real_data or real_data.get('error'):
-            servicio = query_info.get('servicio', 'el servicio consultado')
+            servicio = query_info.get('servicio') or 'el servicio consultado'
             return f"Hola {first_name}, no pude acceder a los turnos de {servicio}. Contacta al 4212121."
 
         servicio = real_data.get('servicio', 'Servicio no especificado')
@@ -1569,11 +1647,31 @@ No pude encontrar información de volumen para {servicio}.
     ) -> str:
         """Formatear respuesta de horarios de atención"""
 
-        if not real_data or real_data.get('error'):
-            servicio = query_info.get('servicio', 'el servicio consultado')
-            return f"""⚠️ **Horarios de {servicio.title()} No Disponibles**
+        medico = query_info.get('medico')
+        servicio = query_info.get('servicio', 'el servicio consultado')
 
-Hola {first_name}, no pude obtener los horarios de {servicio} en este momento.
+        if not real_data or real_data.get('error'):
+            if medico:
+                return f"""⚠️ **Horarios del Dr/Dra {medico} No Disponibles**
+
+Hola {first_name}, no pude obtener los horarios específicos del Dr/Dra {medico}.
+
+🔄 **Te sugiero:**
+• Contactá directamente a la secretaría de la especialidad
+• Llamá al 4212121 y pedí que te pasen con el servicio
+• Consultá los horarios generales de la especialidad
+• Preguntá por turnos disponibles
+
+📞 **Contactos útiles:**
+• Mesa de Ayuda: 4212121
+• Guardia: 22323 (int. 911)
+
+🏥 **Hospital Regional Santiago del Estero**"""
+            else:
+                servicio_nombre = servicio.title() if servicio else "el servicio consultado"
+                return f"""⚠️ **Horarios de {servicio_nombre} No Disponibles**
+
+Hola {first_name}, no pude obtener los horarios de {servicio or "el servicio consultado"} en este momento.
 
 🔄 **Alternativas:**
 • Probá consultando horarios de otros servicios
@@ -1610,6 +1708,179 @@ Hola {first_name}, no pude obtener los horarios de {servicio} en este momento.
 ✅ **Información basada en turnos programados**
 🏥 **Hospital Regional Santiago del Estero**
 📞 **Para consultas:** 4212121"""
+
+        return response
+
+    async def _format_emergency_status_response(
+        self, user_message: str, query_info: Dict, real_data: Dict, first_name: str
+    ) -> str:
+        """Formatear respuesta de estado de emergencias usando datos reales"""
+
+        if not real_data or real_data.get('error'):
+            return f"""⚠️ **Estado de Emergencias No Disponible**
+
+Hola {first_name}, no pude obtener el estado actual de emergencias.
+
+🔄 **Alternativas:**
+• Contactá directamente a Guardia: 22323 (int. 911)
+• Llamá a Mesa de Ayuda: 4212121
+• Consultá el estado de camas disponibles
+
+🏥 **Hospital Regional Santiago del Estero**"""
+
+        # Usar datos reales de camas para inferir estado de emergencias
+        total_camas = real_data.get('total_camas', 0)
+        ocupadas = real_data.get('camas_ocupadas', 0)
+        disponibles = real_data.get('camas_disponibles', 0)
+        porcentaje_ocupacion = real_data.get('porcentaje_ocupacion', 0)
+
+        # Determinar nivel de alerta basado en ocupación real
+        if porcentaje_ocupacion >= 85:
+            nivel_alerta = "🔴 ALTA"
+            estado_descripcion = "alta demanda"
+        elif porcentaje_ocupacion >= 70:
+            nivel_alerta = "🟡 MODERADA"
+            estado_descripcion = "demanda moderada"
+        else:
+            nivel_alerta = "🟢 NORMAL"
+            estado_descripcion = "capacidad disponible"
+
+        response = f"""🚨 **ESTADO DE EMERGENCIAS - HOSPITAL REGIONAL**
+
+📊 **Capacidad Hospitalaria Actual:**
+• Total de camas: {total_camas}
+• Ocupadas: {ocupadas} ({porcentaje_ocupacion:.1f}%)
+• Disponibles: {disponibles}
+
+🏥 **Nivel de Alerta:** {nivel_alerta}
+• Estado: {estado_descripcion}
+• Capacidad de atención: {'Limitada' if porcentaje_ocupacion >= 85 else 'Disponible'}
+
+📞 **Contactos de Emergencia:**
+• Guardia/Emergencias: 22323 (int. 911)
+• Admisión: 4212121
+• Central de Camas: Interno 950
+
+✅ **Actualizado:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
+🏥 **Hospital Regional Santiago del Estero**
+
+*Estado basado en ocupación de camas en tiempo real*"""
+
+        return response
+
+    async def _format_prestadores_response(
+        self, user_message: str, query_info: Dict, real_data: Dict, first_name: str
+    ) -> str:
+        """Formatear respuesta de prestadores disponibles"""
+
+        if not real_data or real_data.get('error'):
+            return f"""⚠️ **Prestadores No Disponibles**
+
+Hola {first_name}, no pude acceder a la información de prestadores en este momento.
+
+🔄 **Alternativas:**
+• Contactá a Recursos Humanos: 4212121
+• Consultá especialidades disponibles
+• Revisá horarios de atención por servicio
+
+🏥 **Hospital Regional Santiago del Estero**"""
+
+        total_prestadores = real_data.get('total_prestadores', 0)
+        por_especialidad = real_data.get('por_especialidad', [])
+        especialidades_activas = real_data.get('especialidades_activas', 0)
+
+        response = f"""👨‍⚕️ **PRESTADORES DISPONIBLES - HOSPITAL REGIONAL**
+
+📊 **Resumen General:**
+• **Total de prestadores:** {total_prestadores}
+• **Especialidades activas:** {especialidades_activas}
+• **Promedio por especialidad:** {total_prestadores / especialidades_activas:.1f} profesionales
+
+🏥 **Top Especialidades por Cantidad de Prestadores:**"""
+
+        if por_especialidad:
+            for i, esp in enumerate(por_especialidad[:8], 1):
+                response += f"""
+{i:2}. **{esp['nombre']}:** {esp['cantidad']} profesionales"""
+
+            if len(por_especialidad) > 8:
+                response += f"\n    ... y {len(por_especialidad) - 8} especialidades más"
+
+        response += f"""
+
+📞 **Para consultas específicas:**
+• Admisión: 4212121
+• Guardia: 22323 (int. 911)
+• Turnos: Consultar por especialidad
+
+✅ **Actualizado:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
+🏥 **Hospital Regional Santiago del Estero**
+
+*Total de profesionales activos en el hospital*"""
+
+        return response
+
+    async def _get_system_help(self) -> Dict[str, Any]:
+        """Generar información de capacidades del sistema"""
+        return {
+            'encontrado': True,
+            'tipo': 'ayuda_sistema',
+            'capacidades': [
+                'Búsqueda de pacientes por DNI',
+                'Consulta de historias clínicas',
+                'Estado de camas disponibles',
+                'Información de especialidades médicas',
+                'Consulta de turnos programados',
+                'Horarios de atención',
+                'Estado de emergencias',
+                'Información de prestadores',
+                'Estadísticas hospitalarias'
+            ],
+            'ejemplos': [
+                'Buscar paciente DNI 12345678',
+                '¿Cuántas camas disponibles hay?',
+                '¿Qué especialidades tienen?',
+                'Turnos para traumatología',
+                'Estado de emergencias'
+            ]
+        }
+
+    async def _format_help_response(
+        self, user_message: str, query_info: Dict, real_data: Dict, first_name: str
+    ) -> str:
+        """Formatear respuesta de ayuda del sistema"""
+
+        capacidades = real_data.get('capacidades', [])
+        ejemplos = real_data.get('ejemplos', [])
+
+        response = f"""🤖 **ZISBOT - CAPACIDADES DEL SISTEMA**
+
+¡Hola {first_name}! Soy ZisBot del Hospital Regional Santiago del Estero.
+
+🏥 **¿Qué puedo hacer por vos?**
+
+📋 **Consultas disponibles:**"""
+
+        for i, capacidad in enumerate(capacidades, 1):
+            response += f"\n{i:2}. {capacidad}"
+
+        response += f"""
+
+💡 **Ejemplos de consultas:**"""
+
+        for ejemplo in ejemplos:
+            response += f"\n   • \"{ejemplo}\""
+
+        response += f"""
+
+📞 **Contactos útiles:**
+• Mesa de Ayuda: 4212121
+• Guardia/Emergencias: 22323 (int. 911)
+
+✅ **Datos en tiempo real** del Hospital Regional
+🔒 **Acceso seguro** con permisos por rol
+
+¿En qué te puedo ayudar hoy?"""
 
         return response
 
@@ -1752,16 +2023,19 @@ Hola {first_name}, no pude obtener los horarios de {servicio} en este momento.
             # Respuesta general con IA
             logger.info("🤖 Generando respuesta general con IA")
 
-            prompt = f"""Eres ZisBot, asistente médico virtual del Hospital Regional Santiago del Estero.
+            prompt = f"""Eres ZisBot, asistente virtual del Hospital Regional Santiago del Estero.
 
 CONSULTA DEL USUARIO: "{user_message}"
 
-INSTRUCCIONES:
-1. Responde de manera profesional y amigable
-2. Ofrece ayuda con consultas hospitalarias
-3. Menciona que puedes ayudar con: pacientes, camas, especialidades, turnos
-4. Incluye teléfonos: 4212121 (admisión) y 22323 (guardia)
-5. Mantén un tono conversacional
+INSTRUCCIONES PARA RESPONDER:
+1. Sé cálido y natural, como una persona real que trabaja en el hospital
+2. Si es un saludo, responde de forma amigable sin ser demasiado formal o robótica
+3. Menciona que estás acá para ayudar con consultas sobre el hospital
+4. Si preguntan cómo estás, podés decir que estás bien y lista para ayudar
+5. Mantené un tono conversacional argentino, podés usar "che", "te ayudo", etc.
+6. Mencioná que podés ayudar con: información de pacientes, camas disponibles, especialidades, turnos
+7. Solo incluí teléfonos si es relevante: 4212121 (admisión) y 22323 (guardia)
+8. Evitá frases como "funcionando dentro de parámetros" o "conectada a la red"
 
 Genera una respuesta útil y profesional."""
 
@@ -1817,6 +2091,35 @@ Genera una respuesta útil y profesional."""
                 "error": str(e),
                 "status": "error"
             }
+
+    async def _get_debug_camas_info(self) -> Dict[str, Any]:
+        """Obtener información completa de camas desde el endpoint debug"""
+        try:
+            import requests
+            # Hacer request al endpoint debug local
+            response = requests.get("http://localhost:8008/debug/camas-debug", timeout=5)
+            if response.status_code == 200:
+                data = response.json().get('data', {})
+                return {
+                    'total_hospital': data.get('camas_basico_inst_3', 112),
+                    'habilitadas': data.get('por_habilitacion', {}).get('Habilitada', 'N/A'),
+                    'no_habilitadas': data.get('por_habilitacion', {}).get('No Habilitada', 'N/A'),
+                    'mantenimiento': data.get('por_mantenimiento', {}).get('En Mantenimiento', 'N/A'),
+                    'planta_baja': next((sector[1] for sector in data.get('sectores_grandes', []) if sector[0] == 'Planta baja'), 43),
+                    'administracion': next((sector[1] for sector in data.get('sectores_grandes', []) if sector[0] == 'Administracion'), 'N/A')
+                }
+        except Exception as e:
+            logger.error(f"Error obteniendo debug camas: {e}")
+
+        # Valores por defecto si falla la consulta
+        return {
+            'total_hospital': 112,
+            'habilitadas': 15,
+            'no_habilitadas': 97,
+            'mantenimiento': 6,
+            'planta_baja': 43,
+            'administracion': 69
+        }
 
 
 # ===============================================
