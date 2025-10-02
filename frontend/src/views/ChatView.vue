@@ -52,7 +52,7 @@
         </p>
 
         <!-- Acciones rápidas -->
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 max-w-2xl mx-auto">
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 max-w-4xl mx-auto">
           <button
             v-for="action in quickActions"
             :key="action.id"
@@ -187,32 +187,46 @@ export default {
     // Acciones rápidas
     const quickActions = ref([
       {
+        id: 'beds_available',
+        title: 'Camas Disponibles',
+        description: 'Consultar disponibilidad',
+        icon: '🛏️',
+        template: '¿Cuántas camas hay disponibles?'
+      },
+      {
         id: 'patient_lookup',
         title: 'Buscar Paciente',
-        description: 'Consultar por DNI',
+        description: 'Por nombre o apellido',
         icon: '👤',
-        template: 'Buscar paciente con DNI: '
+        template: 'Buscar paciente con el nombre '
       },
       {
-        id: 'appointment',
-        title: 'Turnos Médicos',
-        description: 'Consultar o agendar',
-        icon: '📅',
-        template: 'Quiero consultar sobre turnos médicos'
+        id: 'schedules',
+        title: 'Horarios de Atención',
+        description: 'Consultar servicios',
+        icon: '🕐',
+        template: '¿Qué horarios tiene el servicio de guardia?'
       },
       {
-        id: 'specialties',
-        title: 'Especialidades',
-        description: 'Ver disponibles',
-        icon: '👨‍⚕️',
-        template: '¿Qué especialidades están disponibles?'
+        id: 'volume',
+        title: 'Volumen de Atención',
+        description: 'Pacientes atendidos',
+        icon: '📊',
+        template: '¿Cuántos pacientes se atendieron esta semana?'
       },
       {
-        id: 'emergency',
-        title: 'Emergencias',
-        description: 'Información urgente',
-        icon: '🆘',
-        template: 'Necesito información sobre emergencias'
+        id: 'services',
+        title: 'Servicios del Hospital',
+        description: 'Ver especialidades',
+        icon: '🏥',
+        template: '¿Qué servicios tiene el hospital?'
+      },
+      {
+        id: 'help',
+        title: 'Ayuda del Sistema',
+        description: 'Ver qué puedo hacer',
+        icon: '❓',
+        template: '¿Qué consultas puedo hacer?'
       }
     ])
 

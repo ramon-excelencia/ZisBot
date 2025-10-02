@@ -62,34 +62,19 @@ app.add_middleware(
 # Incluir routers
 app.include_router(hospital_router)
 
-# Debug router (temporal)
-from app.routes.debug_camas import router as debug_router
-app.include_router(debug_router)
-# app.include_router(extended_hospital_router)  # DESHABILITADO: tiene errores con turnos
-
 # Importar y incluir router de prestadores
 from app.routes.prestadores_routes import prestadores_router
 app.include_router(prestadores_router)
 
-# Importar y incluir router de turnos - PRUEBA
-try:
-    from app.routes.turnos_test import router as turnos_test_router
-    app.include_router(turnos_test_router)
-    logger.info("✅ Router de turnos TEST registrado correctamente")
-except ImportError as e:
-    logger.warning(f"⚠️ No se pudo cargar el router de turnos TEST: {e}")
-except Exception as e:
-    logger.error(f"❌ Error registrando router de turnos TEST: {e}")
-
-# Importar y incluir router de turnos - COMPLETO
+# Importar y incluir router de turnos
 try:
     from app.routes.turnos_routes import router as turnos_router
     app.include_router(turnos_router)
-    logger.info("✅ Router de turnos COMPLETO registrado correctamente")
+    logger.info("✅ Router de turnos registrado correctamente")
 except ImportError as e:
-    logger.warning(f"⚠️ No se pudo cargar el router de turnos COMPLETO: {e}")
+    logger.warning(f"⚠️ No se pudo cargar el router de turnos: {e}")
 except Exception as e:
-    logger.error(f"❌ Error registrando router de turnos COMPLETO: {e}")
+    logger.error(f"❌ Error registrando router de turnos: {e}")
 
 # Importar y incluir router ORM (nueva arquitectura con LangGraph + Groq)
 try:
