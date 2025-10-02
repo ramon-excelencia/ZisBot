@@ -20,6 +20,10 @@ from app.services.hospital_data_service import hospital_data_service
 from app.services.audit_service import audit_service
 from app.utils.groq_key_rotator import get_groq_key_rotator
 from app.utils.permissions import permission_checker, Permission, mask_sensitive_data
+from app.utils.validators import (
+    validate_dni, validate_date, validate_date_range,
+    validate_query_length, validate_service_name
+)
 # from app.services.memory_service import hybrid_memory, ChatMessage
 
 logger = logging.getLogger(__name__)
@@ -177,12 +181,10 @@ class ChatbotService:
 
     def _validate_input(self, user_message: str) -> tuple[bool, str]:
         """Validar entrada del usuario para seguridad"""
-        if not user_message or not user_message.strip():
-            return False, "Mensaje vacío"
-
-        # Limitar longitud del mensaje
-        if len(user_message) > 1000:
-            return False, "Mensaje demasiado largo (máximo 1000 caracteres)"
+        # Usar validador de longitud
+        validation = validate_query_length(user_message, max_length=500)
+        if not validation['valid']:
+            return False, validation['error']
 
         # Detectar patrones de inyección básicos
         dangerous_patterns = [
@@ -803,8 +805,11 @@ MENSAJE ACTUAL DEL USUARIO:
 
         return {'documento': documento, 'nombre': nombre}
 
-    def _extract_dni(self, message: str) -> str:
-        """Extraer DNI del mensaje"""
+    def _extract_dni(self, message: str) -> Optional[str]:
+        """
+        Extraer y validar DNI del mensaje
+        Retorna DNI validado o None si no es válido
+        """
         dni_patterns = [
             r'dni[:\s]*(\d{7,8})',
             r'documento[:\s]*(\d{7,8})',
@@ -815,7 +820,15 @@ MENSAJE ACTUAL DEL USUARIO:
         for pattern in dni_patterns:
             dni_match = re.search(pattern, message, re.IGNORECASE)
             if dni_match:
-                return dni_match.group(1) if dni_match.groups() else dni_match.group()
+                dni_candidate = dni_match.group(1) if dni_match.groups() else dni_match.group()
+
+                # Validar DNI con el validador
+                validation = validate_dni(dni_candidate)
+                if validation['valid']:
+                    return validation['dni']
+                else:
+                    logger.warning(f"⚠️ DNI inválido detectado: {dni_candidate} - {validation['error']}")
+
         return None
 
     def _extract_service_name(self, message_lower: str) -> str:

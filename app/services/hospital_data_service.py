@@ -7,14 +7,60 @@ from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Any
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_, text, Date
+from sqlalchemy.exc import SQLAlchemyError, OperationalError, DataError
 from app.database.connection import db_connection
 from app.database.models import (
     Cama, Habitacion, Sector, Internacion, Paciente,
     Turno, Especialidad, Consultorio, Prestador, Servicio
 )
 from app.services.orm_hospital_service import orm_hospital_service
+from app.utils.validators import validate_dni, validate_date
 
 logger = logging.getLogger(__name__)
+
+def handle_sql_error(error: Exception, operation: str) -> Dict[str, Any]:
+    """
+    Manejo centralizado de errores SQL con mensajes amigables
+
+    Args:
+        error: Excepción capturada
+        operation: Nombre de la operación (para logs)
+
+    Returns:
+        Dict con error amigable y detalles técnicos
+    """
+    logger.error(f"❌ Error en {operation}: {type(error).__name__} - {str(error)}")
+
+    # Errores de conexión
+    if isinstance(error, OperationalError):
+        return {
+            'error': '🔌 Error de conexión con la base de datos. Intente nuevamente en unos momentos.',
+            'error_type': 'connection_error',
+            'technical_detail': str(error)
+        }
+
+    # Errores de datos/formato
+    if isinstance(error, DataError):
+        return {
+            'error': '❌ Los datos proporcionados son inválidos. Verifique el formato e intente nuevamente.',
+            'error_type': 'data_error',
+            'technical_detail': str(error)
+        }
+
+    # Error genérico de SQLAlchemy
+    if isinstance(error, SQLAlchemyError):
+        return {
+            'error': '⚠️ Error procesando la consulta. Para asistencia: Mesa de Ayuda 4212121',
+            'error_type': 'database_error',
+            'technical_detail': str(error)
+        }
+
+    # Otros errores
+    return {
+        'error': f'❌ Error inesperado: {str(error)}. Para asistencia: Mesa de Ayuda 4212121',
+        'error_type': 'unknown_error',
+        'technical_detail': str(error)
+    }
 
 class HospitalDataService:
     def __init__(self):
@@ -143,8 +189,13 @@ class HospitalDataService:
             return result
 
         except Exception as e:
-            logger.error(f"Error obteniendo estadísticas de camas: {e}")
-            return {'error': str(e), 'total_camas': 0, 'total_ocupadas': 0, 'total_disponibles': 0}
+            error_info = handle_sql_error(e, "get_camas_disponibles")
+            return {
+                **error_info,
+                'total_camas': 0,
+                'total_ocupadas': 0,
+                'total_disponibles': 0
+            }
 
     # 2. HISTORIA CLÍNICA DE PACIENTE
     async def get_historia_clinica(self, documento: str = None, nombre: str = None) -> Dict[str, Any]:
@@ -267,8 +318,8 @@ class HospitalDataService:
             return result
 
         except Exception as e:
-            logger.error(f"Error obteniendo historia clínica: {e}")
-            return {'error': str(e), 'encontrado': False}
+            error_info = handle_sql_error(e, "get_historia_clinica")
+            return {**error_info, 'encontrado': False}
 
     # 3. DATOS DE PACIENTE POR CAMA
     async def get_paciente_en_cama(self, numero_cama: str, sector: str = None) -> Dict[str, Any]:
@@ -496,10 +547,8 @@ class HospitalDataService:
             }
 
         except Exception as e:
-            logger.error(f"Error obteniendo horarios: {e}")
-            import traceback
-            traceback.print_exc()
-            return {'error': str(e), 'encontrado': False}
+            error_info = handle_sql_error(e, "get_horarios_atencion")
+            return {**error_info, 'encontrado': False}
 
     def _format_hora(self, hora_str: str) -> str:
         """Formatear hora de formato HHMM a HH:MM"""
@@ -585,8 +634,8 @@ class HospitalDataService:
             return result
 
         except Exception as e:
-            logger.error(f"Error obteniendo volumen: {e}")
-            return {'error': str(e), 'encontrado': False}
+            error_info = handle_sql_error(e, "get_volumen_atencion")
+            return {**error_info, 'encontrado': False}
 
     # 6. TURNOS PROGRAMADOS
     async def get_turnos_programados(self, servicio_nombre: str, fecha_desde: date = None) -> Dict[str, Any]:
@@ -676,8 +725,8 @@ class HospitalDataService:
             return result
 
         except Exception as e:
-            logger.error(f"Error obteniendo turnos: {e}")
-            return {'error': str(e), 'encontrado': False}
+            error_info = handle_sql_error(e, "get_turnos_programados")
+            return {**error_info, 'encontrado': False}
 
     # 7. CONSULTA DE ESPECIALIDADES DISPONIBLES
     async def get_especialidades_disponibles(self, filtro: str = None) -> Dict[str, Any]:
@@ -732,8 +781,8 @@ class HospitalDataService:
             return result
 
         except Exception as e:
-            logger.error(f"Error obteniendo especialidades: {e}")
-            return {'error': str(e), 'encontrado': False}
+            error_info = handle_sql_error(e, "get_especialidades_disponibles")
+            return {**error_info, 'encontrado': False}
 
     # 8. BÚSQUEDA DE PACIENTE POR NOMBRE
     async def buscar_paciente_por_nombre(self, nombre: str) -> Optional[Dict[str, Any]]:
@@ -939,8 +988,8 @@ class HospitalDataService:
             return result
 
         except Exception as e:
-            logger.error(f"Error obteniendo prestadores: {e}")
-            return {'error': str(e), 'encontrado': False}
+            error_info = handle_sql_error(e, "get_prestadores_por_especialidad")
+            return {**error_info, 'encontrado': False}
 
 # Instancia global del servicio
 hospital_data_service = HospitalDataService()
