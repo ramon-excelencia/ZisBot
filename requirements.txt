@@ -5,20 +5,23 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-dotenv==1.0.0
-pydantic==2.5.0
+pydantic==2.11.9
+pydantic-core==2.33.2
 
 # Base de datos
-sqlalchemy>=2.0.0
-pyodbc>=5.0.1
-motor>=3.3.0
-pymongo>=4.6.0
-redis>=5.0.0
+SQLAlchemy==2.0.43
+pyodbc==5.0.1
+motor==3.3.2
+pymongo==4.6.0
+redis==6.4.0
 
 # AI y LLM
-langchain>=0.1.0
-langchain-groq>=0.1.0
-langchain-core>=0.1.0
-langgraph>=0.0.26
+langchain==0.3.27
+langchain-groq==0.3.8
+langchain-core==0.3.76
+langchain-text-splitters==0.3.11
+langgraph==0.6.7
+langgraph-checkpoint==2.1.1
 
 # Autenticación y seguridad
 python-jose[cryptography]==3.3.0
