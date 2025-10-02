@@ -57,9 +57,20 @@ debug_*.py
 investigar_*.py
 verificar_*.py
 db_inspect_*.py
+explorar_*.py
+consultar_*.py
+probar_*.py
 clear_cache_redis.py
 limpiar_cache_y_arreglar.py
 nul
+
+# Claude Code
+.claude/
+.clinerules
+
+# Documentos temporales
+PROGRESO_*.md
+GROQ_*.md
 
 # Distribución
 build/

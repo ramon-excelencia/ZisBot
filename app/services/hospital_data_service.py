@@ -354,73 +354,166 @@ class HospitalDataService:
     # 4. HORARIOS DE ATENCIÓN POR SERVICIO
     async def get_horarios_atencion(self, servicio_nombre: str) -> Dict[str, Any]:
         """
-        Obtener horarios de atención de un servicio usando el nuevo ORM service
+        Obtener horarios de atención directamente desde ServiciosDias y PrestadorDias
         """
         try:
-            # Primero obtener servicios con horarios para buscar por nombre
-            servicios_result = await orm_hospital_service.obtener_servicios_con_horarios()
-            if not servicios_result.success:
-                return {'error': servicios_result.message, 'encontrado': False}
+            from app.models.entities import ZisServicio, ZisServicioDias, ZisDia, ZisPrestadorDias, ZisPrestador
+            from sqlalchemy import and_
+
+            session = self.get_session()
 
             # Buscar servicio por nombre
-            servicio_id = None
-            servicio_encontrado = None
-            for servicio in servicios_result.data['servicios']:
-                if servicio_nombre.lower() in servicio['nombre'].lower():
-                    servicio_id = servicio['servicio_id']
-                    servicio_encontrado = servicio
-                    break
+            servicio = session.query(ZisServicio).filter(
+                and_(
+                    ZisServicio.Nombre.ilike(f'%{servicio_nombre}%'),
+                    ZisServicio.Anulado == False
+                )
+            ).first()
 
-            # Si no se encuentra en servicios, buscar en especialidades para dar mensaje más específico
-            if not servicio_id:
-                especialidades_result = await orm_hospital_service.obtener_especialidades_con_prestadores()
-                if especialidades_result.success:
-                    for especialidad in especialidades_result.data:
-                        if servicio_nombre.lower() in especialidad['nombre'].lower().strip():
-                            return {
-                                'error': f'La especialidad {especialidad["nombre"].strip()} existe pero no tiene horarios de atención programados',
-                                'encontrado': False,
-                                'especialidad_existe': True,
-                                'prestadores_disponibles': especialidad['cantidad_prestadores']
-                            }
+            if not servicio:
+                return {'error': f'Servicio "{servicio_nombre}" no encontrado', 'encontrado': False}
 
-                return {'error': 'Servicio no encontrado', 'encontrado': False}
+            # Obtener horarios desde ServiciosDias
+            horarios_servicio = session.query(ZisServicioDias, ZisDia).join(
+                ZisDia, ZisServicioDias.DiaID == ZisDia.DiaID
+            ).filter(
+                and_(
+                    ZisServicioDias.ServicioID == servicio.ServicioID,
+                    ZisServicioDias.Anulado == False
+                )
+            ).all()
 
-            # Obtener horarios usando ORM service
-            horarios_result = await orm_hospital_service.obtener_horarios_atencion(servicio_id=servicio_id)
-            if not horarios_result.success:
-                return {'error': horarios_result.message, 'encontrado': False}
+            # Obtener horarios desde PrestadorDias para este servicio
+            horarios_prestador = session.query(ZisPrestadorDias, ZisDia, ZisPrestador).join(
+                ZisDia, ZisPrestadorDias.DiaID == ZisDia.DiaID
+            ).join(
+                ZisPrestador, ZisPrestadorDias.PrestadorID == ZisPrestador.PrestadorID
+            ).filter(
+                and_(
+                    ZisPrestadorDias.ServicioID == servicio.ServicioID,
+                    ZisPrestadorDias.Anulado == False,
+                    ZisPrestador.Anulado == False
+                )
+            ).all()
 
-            # Convertir formato del ORM a formato esperado por chatbot
-            horarios_data = horarios_result.data
+            # Formatear horarios
             horarios_formateados = []
+            dias_procesados = set()
 
-            if 'horarios_por_dia' in horarios_data:
-                for dia_info in horarios_data['horarios_por_dia']:
-                    if dia_info['cantidad'] > 0:
-                        horarios_formateados.append({
-                            'dia': dia_info['dia'],
-                            'hora_inicio': dia_info['hora_inicio'],
-                            'hora_fin': dia_info['hora_fin'],
-                            'cantidad_turnos': dia_info['cantidad']
-                        })
+            # Procesar ServiciosDias
+            for horario, dia in horarios_servicio:
+                if dia.Nombre.strip() not in dias_procesados:
+                    # Calcular turnos totales (Mañana + Tarde, usando campo Turnos o Frecuencia)
+                    turnos_total = horario.Turnos if horario.Turnos else 0
 
-            result = {
+                    # Determinar hora inicio: primer horario disponible
+                    hora_inicio = None
+                    if horario.M_Desde and horario.M_Desde.strip():
+                        hora_inicio = self._format_hora(horario.M_Desde)
+                    elif horario.T_Desde and horario.T_Desde.strip():
+                        hora_inicio = self._format_hora(horario.T_Desde)
+                    elif horario.N_Desde and horario.N_Desde.strip():
+                        hora_inicio = self._format_hora(horario.N_Desde)
+
+                    # Determinar hora fin: último horario disponible
+                    hora_fin = None
+                    if horario.N_Hasta and horario.N_Hasta.strip():
+                        hora_fin = self._format_hora(horario.N_Hasta)
+                    elif horario.T_Hasta and horario.T_Hasta.strip():
+                        hora_fin = self._format_hora(horario.T_Hasta)
+                    elif horario.M_Hasta and horario.M_Hasta.strip():
+                        hora_fin = self._format_hora(horario.M_Hasta)
+
+                    horario_info = {
+                        'dia': dia.Nombre.strip(),
+                        'hora_inicio': hora_inicio,
+                        'hora_fin': hora_fin,
+                        'cantidad_turnos': turnos_total,
+                        'manana': f"{self._format_hora(horario.M_Desde)} - {self._format_hora(horario.M_Hasta)}" if horario.M_Desde and horario.M_Desde.strip() and horario.M_Hasta and horario.M_Hasta.strip() else None,
+                        'tarde': f"{self._format_hora(horario.T_Desde)} - {self._format_hora(horario.T_Hasta)}" if horario.T_Desde and horario.T_Desde.strip() and horario.T_Hasta and horario.T_Hasta.strip() else None
+                    }
+                    horarios_formateados.append(horario_info)
+                    dias_procesados.add(dia.Nombre.strip())
+
+            # Procesar PrestadorDias
+            prestadores_count = set()
+            for horario, dia, prestador in horarios_prestador:
+                prestadores_count.add(prestador.PrestadorID)
+                if dia.Nombre.strip() not in dias_procesados:
+                    # Calcular turnos totales (Mañana + Tarde + Noche)
+                    turnos_total = (horario.CantPacienteM or 0) + (horario.CantPacienteT or 0) + (horario.CantPacienteN or 0)
+
+                    # Determinar hora inicio: primer horario disponible
+                    hora_inicio = None
+                    if horario.M_Desde and horario.M_Desde.strip():
+                        hora_inicio = self._format_hora(horario.M_Desde)
+                    elif horario.T_Desde and horario.T_Desde.strip():
+                        hora_inicio = self._format_hora(horario.T_Desde)
+                    elif horario.N_Desde and horario.N_Desde.strip():
+                        hora_inicio = self._format_hora(horario.N_Desde)
+
+                    # Determinar hora fin: último horario disponible
+                    hora_fin = None
+                    if horario.N_Hasta and horario.N_Hasta.strip():
+                        hora_fin = self._format_hora(horario.N_Hasta)
+                    elif horario.T_Hasta and horario.T_Hasta.strip():
+                        hora_fin = self._format_hora(horario.T_Hasta)
+                    elif horario.M_Hasta and horario.M_Hasta.strip():
+                        hora_fin = self._format_hora(horario.M_Hasta)
+
+                    horario_info = {
+                        'dia': dia.Nombre.strip(),
+                        'hora_inicio': hora_inicio,
+                        'hora_fin': hora_fin,
+                        'cantidad_turnos': turnos_total,
+                        'prestador': prestador.Nombre.strip(),
+                        'manana': f"{self._format_hora(horario.M_Desde)} - {self._format_hora(horario.M_Hasta)}" if horario.M_Desde and horario.M_Desde.strip() and horario.M_Hasta and horario.M_Hasta.strip() else None,
+                        'tarde': f"{self._format_hora(horario.T_Desde)} - {self._format_hora(horario.T_Hasta)}" if horario.T_Desde and horario.T_Desde.strip() and horario.T_Hasta and horario.T_Hasta.strip() else None
+                    }
+                    horarios_formateados.append(horario_info)
+                    dias_procesados.add(dia.Nombre.strip())
+
+            session.close()
+
+            if not horarios_formateados:
+                return {
+                    'encontrado': True,
+                    'servicio': servicio.Nombre.strip(),
+                    'horarios': [],
+                    'consultorios': 0,
+                    'mensaje': 'Servicio encontrado pero sin horarios programados'
+                }
+
+            return {
                 'encontrado': True,
-                'servicio': servicio_encontrado['nombre'],
-                'horarios': horarios_formateados,
-                'consultorios': len(horarios_data.get('prestadores', [])),
+                'servicio': servicio.Nombre.strip(),
+                'horarios': sorted(horarios_formateados, key=lambda x: self._dia_orden(x['dia'])),
+                'consultorios': len(prestadores_count),
                 'estadisticas': {
-                    'total_turnos': horarios_data.get('estadisticas', {}).get('total_turnos', 0),
+                    'total_turnos': sum(h['cantidad_turnos'] for h in horarios_formateados),
                     'dias_con_atencion': len(horarios_formateados)
                 }
             }
 
-            return result
-
         except Exception as e:
             logger.error(f"Error obteniendo horarios: {e}")
+            import traceback
+            traceback.print_exc()
             return {'error': str(e), 'encontrado': False}
+
+    def _format_hora(self, hora_str: str) -> str:
+        """Formatear hora de formato HHMM a HH:MM"""
+        if not hora_str or len(hora_str) < 4:
+            return "00:00"
+        return f"{hora_str[:2]}:{hora_str[2:]}"
+
+    def _dia_orden(self, dia: str) -> int:
+        """Obtener orden del día para sorting"""
+        dias = {
+            'Lunes': 1, 'Martes': 2, 'Miércoles': 3, 'Miercoles': 3,
+            'Jueves': 4, 'Viernes': 5, 'Sábado': 6, 'Sabado': 6, 'Domingo': 7
+        }
+        return dias.get(dia.strip(), 99)
 
     # 5. VOLUMEN DE PACIENTES ATENDIDOS
     async def get_volumen_pacientes(self, servicio_nombre: str = None, fecha_desde: date = None,
@@ -847,91 +940,6 @@ class HospitalDataService:
 
         except Exception as e:
             logger.error(f"Error obteniendo prestadores: {e}")
-            return {'error': str(e), 'encontrado': False}
-
-    # 7. CONSULTA DE HORARIOS DE ATENCIÓN
-    async def get_horarios_atencion(self, servicio_nombre: str = None) -> Dict[str, Any]:
-        """
-        Obtener horarios de atención por servicio/prestador
-        """
-        try:
-            session = self.get_session()
-
-            # Por ahora, devolver horarios estándar del hospital con datos reales
-            horarios_estandar = {
-                'CARDIOLOGIA': {
-                    'dias': 'Lunes a Viernes',
-                    'horario': '08:00 - 14:00',
-                    'ubicacion': 'Consultorio 3 - Planta Alta',
-                    'modalidad': 'Por turno programado',
-                    'telefono': '4212121 - Ext. 150'
-                },
-                'TRAUMATOLOGIA': {
-                    'dias': 'Lunes, Miércoles, Viernes',
-                    'horario': '08:00 - 12:00',
-                    'ubicacion': 'Consultorio 1 - Planta Baja',
-                    'modalidad': 'Por orden de llegada',
-                    'telefono': '4212121 - Ext. 120'
-                },
-                'GINECOLOGIA': {
-                    'dias': 'Martes y Jueves',
-                    'horario': '14:00 - 18:00',
-                    'ubicacion': 'Consultorio 5 - Planta Alta',
-                    'modalidad': 'Por turno programado',
-                    'telefono': '4212121 - Ext. 160'
-                },
-                'PEDIATRIA': {
-                    'dias': 'Lunes a Viernes',
-                    'horario': '08:00 - 12:00 y 14:00 - 18:00',
-                    'ubicacion': 'Consultorio 2 - Planta Baja',
-                    'modalidad': 'Por turno y urgencias',
-                    'telefono': '4212121 - Ext. 130'
-                },
-                'MEDICINA GENERAL': {
-                    'dias': 'Lunes a Viernes',
-                    'horario': '08:00 - 16:00',
-                    'ubicacion': 'Consultorios 4 y 6',
-                    'modalidad': 'Por turno y demanda espontánea',
-                    'telefono': '4212121 - Ext. 110'
-                }
-            }
-
-            if servicio_nombre:
-                servicio_upper = servicio_nombre.upper()
-                if servicio_upper in horarios_estandar:
-                    horario_info = horarios_estandar[servicio_upper]
-                    result = {
-                        'encontrado': True,
-                        'servicio': servicio_nombre,
-                        'dias_atencion': horario_info['dias'],
-                        'horario': horario_info['horario'],
-                        'ubicacion': horario_info['ubicacion'],
-                        'modalidad': horario_info['modalidad'],
-                        'contacto': horario_info['telefono'],
-                        'vigente': True,
-                        'timestamp': datetime.now().isoformat()
-                    }
-                else:
-                    result = {
-                        'encontrado': False,
-                        'servicio': servicio_nombre,
-                        'mensaje': f'Horarios de {servicio_nombre} no disponibles. Contactar Mesa de Informes.',
-                        'contacto_general': '4212121'
-                    }
-            else:
-                # Devolver todos los horarios
-                result = {
-                    'encontrado': True,
-                    'horarios_generales': horarios_estandar,
-                    'total_servicios': len(horarios_estandar),
-                    'timestamp': datetime.now().isoformat()
-                }
-
-            session.close()
-            return result
-
-        except Exception as e:
-            logger.error(f"Error obteniendo horarios: {e}")
             return {'error': str(e), 'encontrado': False}
 
 # Instancia global del servicio

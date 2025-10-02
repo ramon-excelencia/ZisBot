@@ -7,9 +7,6 @@ from typing import Optional
 # Base para modelos ZisMed (SQL Server)
 ZisMedBase = declarative_base()
 
-# Base para modelos MongoDB (logs y cache)
-from app.config.database import Base as MongoBase
-
 # === MODELOS ZISMED REALES (SQL Server) ===
 
 class ZisTurno(ZisMedBase):
@@ -139,48 +136,84 @@ class ZisFarmaciaArticulo(ZisMedBase):
     Anulado = Column(Boolean, nullable=False, default=False, index=True)
     FechaCrea = Column(DateTime, nullable=False)
 
+class ZisServicio(ZisMedBase):
+    """Modelo real de tabla Servicios de ZisMed - Columnas esenciales"""
+    __tablename__ = "Servicios"
+
+    ServicioID = Column(Integer, primary_key=True)
+    Nombre = Column(CHAR(50), nullable=False, index=True)
+    Anulado = Column(Boolean, nullable=False, default=False, index=True)
+
+class ZisDia(ZisMedBase):
+    """Modelo real de tabla Dias de ZisMed"""
+    __tablename__ = "Dias"
+
+    DiaID = Column(Integer, primary_key=True)
+    Nombre = Column(CHAR(15), nullable=False, index=True)
+
+class ZisServicioDias(ZisMedBase):
+    """Modelo real de tabla ServiciosDias de ZisMed"""
+    __tablename__ = "ServiciosDias"
+
+    ServiociosDiasID = Column(Integer, primary_key=True)  # Nota: tiene error de tipeo en la BD
+    ServicioID = Column(Integer, nullable=False, index=True)
+    DiaID = Column(Integer, nullable=False, index=True)
+    Cantidad_Consultorios = Column(Integer, nullable=False)
+    M_Desde = Column(CHAR(4), nullable=True)
+    M_Hasta = Column(CHAR(4), nullable=True)
+    T_Desde = Column(CHAR(4), nullable=True)
+    T_Hasta = Column(CHAR(4), nullable=True)
+    N_Desde = Column(CHAR(4), nullable=True)
+    N_Hasta = Column(CHAR(4), nullable=True)
+    Frecuencia = Column(CHAR(2), nullable=True)
+    Turnos = Column(Integer, nullable=True)
+    Demanda = Column(Boolean, nullable=True)
+    Anulado = Column(Boolean, nullable=False, default=False, index=True)
+
+class ZisPrestador(ZisMedBase):
+    """Modelo real de tabla Prestadores de ZisMed"""
+    __tablename__ = "Prestadores"
+
+    PrestadorID = Column(Integer, primary_key=True)
+    Nombre = Column(CHAR(100), nullable=False, index=True)
+    Matricula = Column(CHAR(20), nullable=True)
+    Documento = Column(CHAR(30), nullable=True)
+    Anulado = Column(Boolean, nullable=False, default=False, index=True)
+
+class ZisPrestadorDias(ZisMedBase):
+    """Modelo real de tabla PrestadorDias de ZisMed"""
+    __tablename__ = "PrestadorDias"
+
+    PrestadorDiasID = Column(Integer, primary_key=True)
+    PrestadorID = Column(Integer, nullable=False, index=True)
+    ServicioID = Column(Integer, nullable=False, index=True)
+    ConsultorioID = Column(Integer, nullable=False)
+    DiaID = Column(Integer, nullable=False, index=True)
+    M_Desde = Column(CHAR(4), nullable=True)
+    M_Hasta = Column(CHAR(4), nullable=True)
+    T_Desde = Column(CHAR(4), nullable=True)
+    T_Hasta = Column(CHAR(4), nullable=True)
+    N_Desde = Column(CHAR(4), nullable=True)
+    N_Hasta = Column(CHAR(4), nullable=True)
+    Frecuencia = Column(CHAR(2), nullable=True)
+    CantPacienteM = Column(Integer, nullable=True)
+    CantPacienteT = Column(Integer, nullable=True)
+    CantPacienteN = Column(Integer, nullable=True)
+    Anulado = Column(Boolean, nullable=False, default=False, index=True)
+    PrestadoresInstitucionesID = Column(Integer, nullable=True, index=True)
+
 # === MODELOS MONGODB (para logs y cache) ===
-
-class Clinica(MongoBase):
-    """Modelo para configuración de clínicas (MongoDB)"""
-    __tablename__ = "clinicas"
-
-    id = Column(Integer, primary_key=True, index=True)
-    nombre = Column(String(100), nullable=False, index=True)
-    configuraciones = Column(JSON, nullable=True)
-    did_whatsapp = Column(String(50), unique=True, index=True)
-    activa = Column(Boolean, default=True, nullable=False)
-    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
-    fecha_actualizacion = Column(DateTime(timezone=True), onupdate=func.now())
-
-class LogIA(MongoBase):
-    """Modelo para logs de IA (MongoDB)"""
-    __tablename__ = "logs_ia"
-
-    id = Column(Integer, primary_key=True, index=True)
-    mensaje = Column(Text, nullable=False)
-    respuesta_ia = Column(Text, nullable=False)
-    confianza = Column(String(20), nullable=True)
-    fecha = Column(DateTime(timezone=True), server_default=func.now(), index=True)
-    metadatos = Column(JSON, nullable=True)
-
-    __table_args__ = (
-        Index('idx_log_fecha_confianza', 'fecha', 'confianza'),
-    )
-
-class CacheConsulta(MongoBase):
-    """Cache para consultas frecuentes (MongoDB)"""
-    __tablename__ = "cache_consultas"
-
-    id = Column(Integer, primary_key=True, index=True)
-    tipo_consulta = Column(String(50), nullable=False, index=True)
-    parametros_hash = Column(String(64), nullable=False, index=True)
-    resultado = Column(JSON, nullable=False)
-    fecha_cache = Column(DateTime(timezone=True), server_default=func.now())
-    expira_en = Column(DateTime(timezone=True), nullable=False, index=True)
-    institucion_id = Column(Integer, nullable=True, index=True)
-
-    __table_args__ = (
-        Index('idx_cache_tipo_params', 'tipo_consulta', 'parametros_hash'),
-        Index('idx_cache_expiracion', 'expira_en'),
-    )
+# Comentados temporalmente - MongoDB no está en uso actualmente
+# from app.config.database import Base as MongoBase
+#
+# class Clinica(MongoBase):
+#     """Modelo para configuración de clínicas (MongoDB)"""
+#     __tablename__ = "clinicas"
+#
+#     id = Column(Integer, primary_key=True, index=True)
+#     nombre = Column(String(100), nullable=False, index=True)
+#     configuraciones = Column(JSON, nullable=True)
+#     did_whatsapp = Column(String(50), unique=True, index=True)
+#     activa = Column(Boolean, default=True, nullable=False)
+#     fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+#     fecha_actualizacion = Column(DateTime(timezone=True), onupdate=func.now())
