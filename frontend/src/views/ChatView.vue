@@ -196,16 +196,16 @@ export default {
       {
         id: 'patient_lookup',
         title: 'Buscar Paciente',
-        description: 'Por nombre o apellido',
+        description: 'Por DNI',
         icon: '👤',
-        template: 'Buscar paciente con el nombre '
+        template: 'Buscar paciente con DNI '
       },
       {
         id: 'schedules',
         title: 'Horarios de Atención',
         description: 'Consultar servicios',
         icon: '🕐',
-        template: '¿Qué horarios tiene el servicio de guardia?'
+        template: '¿Qué horarios tiene traumatología?'
       },
       {
         id: 'volume',
@@ -224,7 +224,7 @@ export default {
       {
         id: 'help',
         title: 'Ayuda del Sistema',
-        description: 'Ver qué puedo hacer',
+        description: 'Ver capacidades',
         icon: '❓',
         template: '¿Qué consultas puedo hacer?'
       }

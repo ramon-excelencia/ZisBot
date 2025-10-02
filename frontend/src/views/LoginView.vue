@@ -35,7 +35,7 @@
             v-model="formData.cuil"
             type="text"
             class="form-input"
-            placeholder="Ej: 27357388827"
+            placeholder="Ej: 20123456789"
             required
             :disabled="isLoading"
             @input="formatCuil"
@@ -128,14 +128,13 @@
         </button>
       </form>
 
-      <!-- Información de prueba -->
+      <!-- Información de acceso -->
       <div class="mt-8 pt-6 border-t border-gray-200">
         <div class="text-center text-sm text-gray-500">
-          <p class="font-medium mb-2">Credenciales de Prueba:</p>
+          <p class="font-medium mb-2">Información de Acceso:</p>
           <div class="bg-gray-50 rounded-lg p-3 text-left">
-            <p><strong>CUIL:</strong> 27357388827</p>
-            <p><strong>Contraseña:</strong> simon0</p>
-            <p><strong>Usuario:</strong> Yanet Villalba</p>
+            <p>Utilice sus credenciales de ZisMed para acceder al sistema.</p>
+            <p class="mt-2 text-xs">Para soporte técnico: Mesa de Ayuda 4212121</p>
           </div>
         </div>
       </div>
@@ -371,15 +370,8 @@ export default {
     // Watch para cambios en la institución seleccionada
     watch(selectedInstitutionId, onInstitutionChange);
 
-    // Auto-completar credenciales de prueba en desarrollo
+    // Inicialización
     onMounted(() => {
-      if (import.meta.env.DEV) {
-        formData.value = {
-          cuil: "27357388827",
-          password: "simon0",
-        };
-      }
-
       // Verificar si ya está logueado
       if (apiUtils.isAuthenticated()) {
         router.push("/chat");

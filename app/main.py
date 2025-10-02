@@ -106,22 +106,16 @@ except ImportError:
     logger.warning("Simple chat routers no disponibles")
 
 # ===============================================
-# DATOS DE USUARIOS (TEMPORAL - MOVER A BASE DE DATOS)
+# AUTENTICACIÓN TEMPORAL
+# ===============================================
+# IMPORTANTE: Este diccionario se usa solo para desarrollo/testing
+# Para producción, migrar a consulta directa de usuarios desde ZisMed
+# Ver README.md para credenciales de acceso
 # ===============================================
 
 USERS_DB = {
-    "27357388827": {
-        "password": "simon0",
-        "user_data": {
-            "user_id": "yanet_villalba",
-            "user_name": "Yanet Villalba",
-            "role": "coordinadora_gestion",
-            "institution": "Hospital Regional Santiago del Estero",
-            "hospital_id": "3",
-            "cuil": "27357388827",  # ✅ FILTRADO AUTOMÁTICO: CUIL para consultas
-            "password": "simon0"  # ✅ FILTRADO AUTOMÁTICO: Password para consultas
-        }
-    }
+    # Los usuarios reales de ZisMed deben agregarse aquí para testing
+    # Formato: "CUIL": {"password": "...", "user_data": {...}}
 }
 
 # ===============================================

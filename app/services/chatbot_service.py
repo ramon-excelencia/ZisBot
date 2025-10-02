@@ -2206,19 +2206,18 @@ Hola {first_name}, no pude acceder a la información de prestadores en este mome
                 'Búsqueda de pacientes por DNI',
                 'Consulta de historias clínicas',
                 'Estado de camas disponibles',
-                'Información de especialidades médicas',
-                'Consulta de turnos programados',
-                'Horarios de atención',
-                'Estado de emergencias',
-                'Información de prestadores',
-                'Estadísticas hospitalarias'
+                'Información de servicios del hospital',
+                'Horarios de atención por servicio',
+                'Volumen de pacientes atendidos',
+                'Información de prestadores médicos',
+                'Estadísticas hospitalarias en tiempo real'
             ],
             'ejemplos': [
                 'Buscar paciente DNI 12345678',
-                '¿Cuántas camas disponibles hay?',
-                '¿Qué especialidades tienen?',
-                'Turnos para traumatología',
-                'Estado de emergencias'
+                '¿Cuántas camas hay disponibles?',
+                '¿Qué servicios tiene el hospital?',
+                'Horarios de traumatología',
+                'Volumen de atención de esta semana'
             ]
         }
 

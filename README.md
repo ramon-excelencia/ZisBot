@@ -17,29 +17,51 @@ pip install -r requirements.txt
 ```
 
 ### 2. Configurar variables de entorno
-- Copiar `.env.example` a `.env`
-- Configurar credenciales de ZISMED y Groq
-
-### 3. Iniciar el sistema
 ```bash
-# Servidor principal (recomendado para producción)
-python iniciar_servidor_sin_reload.py
-
-# Servidor con autoreload (desarrollo)
-python iniciar_servidor.py
+cp .env.example .env
+# Editar .env con credenciales de ZISMED y Groq
 ```
 
-### 4. Frontend (opcional)
+### 3. Configurar usuario de testing
+Editar `app/main.py` línea 116 y agregar usuario real de ZisMed:
+```python
+USERS_DB = {
+    "TU_CUIL": {
+        "password": "tu_password",
+        "user_data": {
+            "user_id": "tu_usuario",
+            "user_name": "Tu Nombre",
+            "role": "coordinadora_gestion",  # o el rol correspondiente
+            "institution": "Hospital Regional Santiago del Estero",
+            "hospital_id": "3",
+            "cuil": "TU_CUIL",
+            "password": "tu_password"
+        }
+    }
+}
+```
+
+**Para Mesa de Ayuda:** Usar credenciales de Yanet Villalba (Coordinadora de Gestión)
+
+### 4. Iniciar servicios requeridos
 ```bash
+# MongoDB (necesario para auditoría)
+mongod --dbpath /path/to/data
+
+# Redis (necesario para memoria conversacional)
+redis-server
+```
+
+### 5. Iniciar el sistema
+```bash
+# Backend
+python iniciar_servidor.py
+
+# Frontend (en otra terminal)
 cd frontend
 npm install
-npm start
+npm run dev
 ```
-
-## 🔐 Credenciales de Prueba
-- **CUIL:** 27357388827
-- **Contraseña:** simon0
-- **Usuario:** Yanet Villalba (Coordinadora de Gestión)
 
 ## 🌐 Endpoints Principales
 - **API Principal:** http://localhost:8009/api/chat
