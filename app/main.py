@@ -382,7 +382,8 @@ async def chat_endpoint(
             conversation_id=user_context.get("session_id", "temp_session"),
             user_id=user_data.get("user_id", "temp_user"),
             hospital_id=str(user_context.get("hospital_id", "3")),
-            user_name=user_data.get("user_name", "Usuario")
+            user_name=user_data.get("user_name", "Usuario"),
+            user_role=user_data.get("role", "invitado")  # ✅ Validación de permisos por rol
         )
         logger.info("✅ CHAT: Respuesta generada con servicio unificado")
         logger.info(f"🔍 RESPUESTA CRUDA: {response}")

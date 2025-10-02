@@ -17,6 +17,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from app.integrations.working_langgraph_agent import working_langgraph_agent
 from app.services.orm_hospital_service import orm_hospital_service
 from app.services.hospital_data_service import hospital_data_service
+from app.services.audit_service import audit_service
+from app.utils.groq_key_rotator import get_groq_key_rotator
+from app.utils.permissions import permission_checker, Permission, mask_sensitive_data
 # from app.services.memory_service import hybrid_memory, ChatMessage
 
 logger = logging.getLogger(__name__)
@@ -31,15 +34,17 @@ class ChatbotService:
     """
 
     def __init__(self, groq_api_key: str, redis_url: str = "redis://localhost:6379"):
-        # LangChain/LangGraph setup
-        self.groq_api_key = groq_api_key
+        # LangChain/LangGraph setup con rotación de keys
+        self.key_rotator = get_groq_key_rotator()
+        self.groq_api_key = self.key_rotator.get_current_key() or groq_api_key
         self.llm = ChatGroq(
-            groq_api_key=groq_api_key,
+            groq_api_key=self.groq_api_key,
             model_name="llama-3.1-8b-instant",
             temperature=0.3,
             max_tokens=2048
         )
         self.workflow = working_langgraph_agent
+        logger.info(f"🔑 Usando Groq con {self.key_rotator.get_total_keys()} keys disponibles")
 
         # Redis setup for persistent memory
         try:
@@ -57,6 +62,80 @@ class ChatbotService:
         # Cache settings
         self.cache_expiry = 300  # 5 minutos
         logger.info("🚀 ChatbotService inicializado correctamente")
+
+    async def _log_to_audit(
+        self,
+        user_id: str,
+        user_name: str,
+        conversation_id: str,
+        query_type: str,
+        user_message: str,
+        bot_response: str,
+        hospital_id: str,
+        query_info: Dict = None,
+        real_data: Dict = None
+    ):
+        """
+        Registrar consulta en MongoDB para trazabilidad
+        Cumple criterio: "Cada consulta quedará registrada con fecha,
+        usuario, motivo/tipo de consulta y paciente/servicio involucrado"
+        """
+        try:
+            # Extraer datos accedidos según el tipo de consulta
+            data_accessed = {}
+
+            if query_type in ['horarios_atencion', 'turnos_programados']:
+                data_accessed = {
+                    "servicio": query_info.get('servicio') if query_info else None,
+                    "medico": query_info.get('medico') if query_info else None
+                }
+
+            elif query_type == 'camas_disponibles':
+                data_accessed = {
+                    "servicio": query_info.get('servicio') if query_info else None,
+                    "total_camas": real_data.get('total_camas') if real_data else None,
+                    "disponibles": real_data.get('disponibles') if real_data else None
+                }
+
+            elif query_type in ['historia_clinica', 'historia_clinica_dni']:
+                data_accessed = {
+                    "paciente_dni": query_info.get('documento') if query_info else None,
+                    "paciente_nombre": query_info.get('nombre') if query_info else None
+                }
+
+            elif query_type == 'volumen_pacientes':
+                data_accessed = {
+                    "servicio": query_info.get('servicio') if query_info else None,
+                    "fecha_desde": str(query_info.get('fecha_desde')) if query_info else None,
+                    "fecha_hasta": str(query_info.get('fecha_hasta')) if query_info else None
+                }
+
+            # Registrar en MongoDB
+            logger.info(f"📝 Intentando registrar auditoría para: {query_type}")
+            success = await audit_service.log_query(
+                user_id=user_id,
+                user_name=user_name,
+                conversation_id=conversation_id,
+                query_type=query_type,
+                user_message=user_message,
+                bot_response=bot_response[:500],  # Limitar tamaño
+                hospital_id=hospital_id,
+                data_accessed=data_accessed,
+                metadata={
+                    "timestamp": datetime.now().isoformat(),
+                    "has_real_data": real_data is not None and len(real_data) > 0
+                }
+            )
+
+            if success:
+                logger.info(f"✅ Auditoría registrada exitosamente en MongoDB")
+            else:
+                logger.warning(f"⚠️ Auditoría NO registrada (MongoDB no disponible)")
+
+        except Exception as e:
+            logger.warning(f"⚠️ Error en auditoría (no crítico): {e}")
+            import traceback
+            traceback.print_exc()
 
     def _clean_text(self, text: str) -> str:
         """Limpiar texto eliminando espacios excesivos y caracteres extra"""
@@ -181,10 +260,12 @@ class ChatbotService:
         conversation_id: str,
         user_id: str,
         hospital_id: str,
-        user_name: str = None
+        user_name: str = None,
+        user_role: str = "invitado"
     ) -> str:
         """
         Procesar mensaje del usuario usando el sistema completo
+        Incluye validación de permisos según rol
         """
         start_time = time.time()
         try:
@@ -201,9 +282,9 @@ class ChatbotService:
 
             logger.info(f"📨 Procesando: {user_message[:50]}... | Usuario: {first_name}")
 
-            # 2. ANALIZAR TIPO DE CONSULTA MÉDICA
+            # 2. ANALIZAR TIPO DE CONSULTA MÉDICA (con contexto de conversación)
             try:
-                query_info = await self._analyze_medical_query(user_message)
+                query_info = await self._analyze_medical_query(user_message, conversation_history=history)
                 logger.info(f"🔍 ANÁLISIS: {query_info}")
             except Exception as analysis_error:
                 logger.error(f"ERROR EN ANÁLISIS: {analysis_error}")
@@ -212,8 +293,22 @@ class ChatbotService:
             real_data = None
             use_real_data = False
 
-            # 3. SI ES CONSULTA MÉDICA ESPECÍFICA, OBTENER DATOS REALES
+            # 3. SI ES CONSULTA MÉDICA ESPECÍFICA, VALIDAR PERMISOS Y OBTENER DATOS
             if query_info['type'] != 'general':
+                # VALIDAR PERMISOS ANTES DE OBTENER DATOS
+                permission_required = self._get_permission_for_query_type(query_info['type'])
+                if permission_required and not permission_checker.has_permission(user_role, permission_required):
+                    logger.warning(f"❌ PERMISO DENEGADO: {user_role} intentó acceder a {query_info['type']}")
+                    return f"""🔒 **ACCESO DENEGADO**
+
+Lo siento {first_name}, no tenés permisos para acceder a este tipo de información.
+
+Tu rol actual: **{user_role}**
+Información solicitada: **{query_info['type']}**
+
+📞 **Para solicitar acceso adicional**, contactar a administración del hospital.
+"""
+
                 # Verificar caché para consultas frecuentes
                 cache_key = None
                 if query_info['type'] == 'camas_disponibles':
@@ -227,8 +322,6 @@ class ChatbotService:
 
                 if not real_data:
                     logger.info(f"🏥 Obteniendo datos reales para: {query_info['type']}")
-                    # Determinar rol del usuario (por defecto directivo para Fase 1)
-                    user_role = 'directivo'  # En Fase 1 todos los usuarios son directivos
                     real_data = await self._get_real_hospital_data(query_info, user_id, user_role)
 
                     # Guardar en caché si es consulta de camas
@@ -247,7 +340,7 @@ class ChatbotService:
             if use_real_data and real_data:
                 # Usar datos reales para respuesta directa y precisa
                 response = await self._generate_response_with_real_data(
-                    user_message, query_info, real_data, first_name
+                    user_message, query_info, real_data, first_name, conversation_id
                 )
                 confidence = 0.95
                 intent = query_info['type']
@@ -296,6 +389,19 @@ class ChatbotService:
                 conversation_id, user_message, response, intent, confidence, hospital_id
             )
 
+            # 6. REGISTRAR EN AUDITORÍA (MongoDB)
+            await self._log_to_audit(
+                user_id=user_id,
+                user_name=user_name or "Usuario",
+                conversation_id=conversation_id,
+                query_type=intent,
+                user_message=user_message,
+                bot_response=response,
+                hospital_id=hospital_id,
+                query_info=query_info if 'query_info' in locals() else {},
+                real_data=real_data if 'real_data' in locals() else {}
+            )
+
             # Calcular tiempo de procesamiento
             processing_time = round((time.time() - start_time) * 1000, 2)  # en ms
             logger.info(f"✅ Respuesta generada - Intent: {intent}, Confianza: {confidence}, Tiempo: {processing_time}ms")
@@ -317,12 +423,159 @@ class ChatbotService:
 
             return error_response
 
-    async def _analyze_medical_query(self, message: str) -> Dict:
+    async def _classify_intent_with_ai(self, message: str, conversation_history: list = None) -> Dict:
+        """
+        Usar IA para clasificar la intención del mensaje
+        Más flexible que keywords, detecta variaciones naturales
+        AHORA CON CONTEXTO para entender preguntas de seguimiento
+        """
+        try:
+            # Construir contexto de conversación
+            context_text = ""
+            if conversation_history and len(conversation_history) > 0:
+                # Tomar últimos 3-5 mensajes para contexto
+                recent_messages = conversation_history[-5:]
+                context_lines = []
+                for msg in recent_messages:
+                    role = msg.get('role', 'unknown')
+                    content = msg.get('content', '')
+                    if role == 'user':
+                        context_lines.append(f"Usuario: {content}")
+                    elif role == 'assistant':
+                        context_lines.append(f"Asistente: {content}")
+
+                if context_lines:
+                    context_text = "\n".join(context_lines)
+
+            system_message = """Eres un clasificador de intenciones para un sistema hospitalario.
+Analiza el mensaje del usuario y clasifica su intención en una de estas categorías:
+
+CATEGORÍAS DISPONIBLES:
+1. horarios_atencion - Preguntas sobre horarios de servicios o médicos
+2. camas_disponibles - Consultas sobre disponibilidad de camas
+3. historia_clinica - Búsqueda de historia clínica de paciente
+4. volumen_pacientes - Consultas sobre cantidad de pacientes atendidos
+5. turnos_programados - Consultas sobre turnos o agenda
+6. busqueda_paciente - Búsqueda de datos de paciente
+7. ayuda_sistema - SOLO cuando pide ayuda de cómo usar el sistema (ej: "ayuda", "qué puedes hacer", "cómo funciona")
+8. general - Conversación general, saludos, consultas sobre servicios/especialidades disponibles, etc.
+
+IMPORTANTE:
+- Si menciona horarios, cuando atiende, qué hora, qué días, disponibilidad horaria → horarios_atencion
+- Si menciona "camas disponibles", "camas libres", "camas ocupadas", terapia intensiva → camas_disponibles
+- Si menciona historia, historial clínico, expediente → historia_clinica
+- Si menciona pacientes atendidos, volumen, cantidad → volumen_pacientes
+- Si pregunta por "servicios del hospital", "qué servicios", "listado de servicios", "especialidades", "servicios disponibles" → general (NO camas ni ayuda_sistema)
+- Si el usuario hace una pregunta corta como "y de cardiología?", "y cardiologia?", "genial, y cardiologia?", usa el CONTEXTO de mensajes previos para determinar la intención (ej: si antes preguntó por horarios, sigue siendo horarios)
+- Palabras como "genial", "perfecto", "gracias" NO cambian la intención si hay un "y" + servicio después
+- ayuda_sistema es SOLO para cuando explícitamente pide ayuda del chatbot ("ayuda", "qué puedes hacer", "cómo funciona")
+
+Responde SOLO con un JSON en este formato:
+{{"intent": "categoria", "confidence": 0.95, "entities": {{"servicio": "traumatologia"}}}}"""
+
+            # Si hay contexto, agregarlo al prompt
+            if context_text:
+                user_message_with_context = f"""CONTEXTO DE CONVERSACIÓN PREVIA:
+{context_text}
+
+MENSAJE ACTUAL DEL USUARIO:
+{message}"""
+            else:
+                user_message_with_context = message
+
+            classification_prompt = ChatPromptTemplate.from_messages([
+                ("system", system_message),
+                ("user", "{message}")
+            ])
+
+            llm = ChatGroq(
+                model="llama-3.3-70b-versatile",
+                temperature=0.1,
+                groq_api_key=self.groq_api_key
+            )
+
+            chain = classification_prompt | llm
+            response = await chain.ainvoke({"message": user_message_with_context})
+
+            # Parsear respuesta JSON
+            import json
+            content = response.content.strip()
+
+            # Intentar extraer JSON si viene con texto adicional
+            if '{' in content and '}' in content:
+                start = content.find('{')
+                end = content.rfind('}') + 1
+                json_str = content[start:end]
+                result = json.loads(json_str)
+                logger.info(f"🤖 CLASIFICACIÓN IA: {result}")
+                return result
+            else:
+                logger.warning(f"⚠️ Respuesta IA no es JSON válido: {content}")
+                return {'intent': 'unknown', 'confidence': 0.0}
+
+        except Exception as e:
+            logger.warning(f"⚠️ Error en clasificación IA: {e}")
+
+            # Detectar rate limit y rotar key
+            if 'rate_limit' in str(e).lower() or '429' in str(e):
+                logger.info("🔄 Detectado rate limit, rotando API key...")
+                new_key = self.key_rotator.rotate_key()
+                if new_key and new_key != self.groq_api_key:
+                    self.groq_api_key = new_key
+                    logger.info(f"✅ Rotado a nueva key (total: {self.key_rotator.get_total_keys()})")
+                else:
+                    logger.warning("⚠️ No hay más keys disponibles para rotar")
+
+            import traceback
+            traceback.print_exc()
+            return {'intent': 'unknown', 'confidence': 0.0}
+
+    async def _analyze_medical_query(self, message: str, conversation_history: list = None) -> Dict:
         """
         Analizar mensaje para detectar consultas médicas específicas
+        ENFOQUE HÍBRIDO: IA primero, luego keywords como complemento
+        Ahora considera el contexto de la conversación
         """
         message_lower = message.lower()
         logger.info(f"🔍 ANALIZANDO: '{message}' -> '{message_lower}'")
+
+        # PASO 1: Intentar clasificación con IA (más flexible, ahora con contexto)
+        ai_classification = await self._classify_intent_with_ai(message, conversation_history)
+
+        if ai_classification.get('confidence', 0) >= 0.7 and ai_classification.get('intent') != 'unknown':
+            intent = ai_classification['intent']
+            logger.info(f"✨ Usando clasificación IA: {intent} (confianza: {ai_classification.get('confidence')})")
+
+            # Extraer entidades según el intent detectado por IA
+            if intent == 'horarios_atencion':
+                servicio = self._extract_service_name(message_lower)
+                return {
+                    'type': 'horarios_atencion',
+                    'servicio': servicio,
+                    'medico': None
+                }
+            elif intent == 'camas_disponibles':
+                servicio = self._extract_service_name(message_lower)
+                fecha = self._extract_date_from_message(message_lower)
+                return {
+                    'type': 'camas_disponibles',
+                    'servicio': servicio,
+                    'fecha': fecha
+                }
+            elif intent == 'volumen_pacientes':
+                servicio = self._extract_service_name(message_lower)
+                fecha_desde, fecha_hasta = self._extract_date_range(message_lower)
+                return {
+                    'type': 'volumen_pacientes',
+                    'servicio': servicio,
+                    'fecha_desde': fecha_desde,
+                    'fecha_hasta': fecha_hasta
+                }
+            elif intent == 'ayuda_sistema':
+                return {'type': 'ayuda_sistema'}
+
+        # PASO 2: Fallback a detección basada en keywords
+        logger.info("🔑 Usando detección por keywords como fallback")
 
         # 0. AYUDA/CAPACIDADES DEL SISTEMA (PRIORIDAD ALTA)
         ayuda_keywords = ['ayuda', 'help', 'qué puedo', 'que puedo', 'qué consultas', 'que consultas', 'como funciona', 'capacidades', 'funcionalidades']
@@ -367,8 +620,9 @@ class ChatbotService:
             }
 
         # 4. CAMAS DISPONIBLES (PRIORIDAD ALTA - antes que turnos)
+        # Excluir "servicios disponibles" y "especialidades disponibles"
         if any(word in message_lower for word in ['cama', 'camas', 'libre', 'ocupad']) or (
-            'disponible' in message_lower and not any(esp in message_lower for esp in ['especialidad', 'especialidades'])
+            'disponible' in message_lower and not any(esp in message_lower for esp in ['especialidad', 'especialidades', 'servicio', 'servicios'])
         ):
             servicio = self._extract_service_name(message_lower)
             fecha = self._extract_date_from_message(message_lower)
@@ -380,8 +634,12 @@ class ChatbotService:
             }
 
         # 5. HORARIOS DE ATENCIÓN (PRIORIDAD ANTES QUE TURNOS)
-        horario_keywords = ['horarios', 'atencion', 'horario', 'cuando atiende', 'que horario', 'a que hora']
-        horario_phrases = ['horarios de', 'horario de', 'horarios atencion', 'cuando atiende']
+        horario_keywords = ['horarios', 'atencion', 'horario', 'cuando atiende', 'que horario', 'a que hora',
+                           'disponibilidad horaria', 'que dias atiende', 'que dia atiende', 'cuando puedo ir',
+                           'hora atiende', 'dias atiende']
+        horario_phrases = ['horarios de', 'horario de', 'horarios atencion', 'cuando atiende', 'a que hora',
+                          'que horario', 'que dias atiende', 'disponibilidad de', 'disponibilidad horaria',
+                          'hora atiende', 'dias atiende']
         medico_patterns = ['dr ', 'dra ', 'doctor ', 'doctora ']
 
         if (any(word in message_lower for word in horario_keywords) or
@@ -418,12 +676,13 @@ class ChatbotService:
                 'servicio': servicio
             }
 
-        # 5.5 ESPECIALIDADES - PRIORIDAD ALTA (antes que camas)
-        if any(word in message_lower for word in ['especialidad', 'especialidades', 'especialista', 'especialistas']):
-            logger.info(f"🏥 DETECTADO: especialidades_disponibles")
-            return {
-                'type': 'especialidades_disponibles'
-            }
+        # 5.5 ESPECIALIDADES - Deshabilitado para que caiga a general y sea manejado por LangGraph
+        # Esto permite que LangGraph liste los servicios de forma más completa
+        # if any(word in message_lower for word in ['especialidad', 'especialidades', 'especialista', 'especialistas']):
+        #     logger.info(f"🏥 DETECTADO: especialidades_disponibles")
+        #     return {
+        #         'type': 'especialidades_disponibles'
+        #     }
 
         # 5.7 ESTADO DE EMERGENCIAS/GUARDIA
         emergencia_phrases = ['estado de emergencias', 'estado de guardia', 'emergencias del hospital', 'como esta la guardia', 'estado guardia']
@@ -479,6 +738,40 @@ class ChatbotService:
         logger.info(f"❓ DETECTADO: consulta_general")
         return {'type': 'general'}
 
+    def _get_permission_for_query_type(self, query_type: str) -> Optional[Permission]:
+        """
+        Mapear tipo de consulta a permiso requerido
+
+        Args:
+            query_type: Tipo de consulta detectada
+
+        Returns:
+            Permission requerido o None si no requiere permisos especiales
+        """
+        permission_map = {
+            # Búsqueda de pacientes
+            'busqueda_paciente_nombre': Permission.VER_DATOS_PACIENTE,
+            'busqueda_paciente_dni': Permission.VER_DATOS_PACIENTE,
+
+            # Historia clínica
+            'historia_clinica': Permission.VER_HISTORIA_CLINICA,
+            'historia_clinica_dni': Permission.VER_HISTORIA_CLINICA,
+
+            # Camas
+            'camas_disponibles': Permission.VER_CAMAS_DISPONIBLES,
+
+            # Estadísticas
+            'volumen_pacientes': Permission.VER_VOLUMEN_ATENCION,
+
+            # Información general (no requiere permisos especiales)
+            'horarios_atencion': Permission.VER_HORARIOS,
+            'servicios_hospital': Permission.VER_SERVICIOS,
+            'ayuda_sistema': None,
+            'general': None,
+        }
+
+        return permission_map.get(query_type)
+
     def _extract_patient_info(self, message: str) -> Dict:
         """Extraer información del paciente del mensaje"""
         logger.info(f"🔍 EXTRAYENDO INFO PACIENTE: '{message}'")
@@ -488,30 +781,22 @@ class ChatbotService:
         documento = dni_match.group(1) if dni_match else None
         logger.info(f"🆔 DNI: {documento}")
 
-        # Extraer nombre con patrones mejorados - ORDEN ESPECÍFICO A GENERAL
-        name_patterns = [
-            # Patrón 1: "con apellido [APELLIDO]" - MÁS ESPECÍFICO - SOLO ÚLTIMA PALABRA
-            r'(?:con\s+apellido|apellido)\s+([A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+)(?:\s|$)',
-            # Patrón 2: "con nombre [NOMBRE]" - SOLO PRIMERA PALABRA DESPUÉS
-            r'(?:con\s+nombre)\s+([A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+)(?:\s|$)',
-            # Patrón 3: "llamado [NOMBRE]"
-            r'llamad[oa]\s+([A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+(?:\s+[A-ZÁÉÍÓÚñÑa-záéíóúñÑ]+)*)',
-            # Patrón 4: "siguiente paciente/nombre: [NOMBRE]"
-            r'siguiente\s+(?:paciente|nombre)[\s:]+([A-ZÁÉÍÓÚñÑa-záéíóúñÑ\s]+)',
-            # Patrón 5: Nombres todo en mayúsculas (formato hospital)
-            r'\b([A-ZÁÉÍÓÚÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ]{2,})+)\b',
-            # Patrón 6: Formato título tradicional
-            r'(?:historia|historial|clinica|expediente).*?(?:de|del|para)\s+([A-ZÁÉÍÓÚñÑ][a-záéíóúñÑ]+\s+[A-ZÁÉÍÓÚñÑ][a-záéíóúñÑ]+)',
-        ]
+        # Extraer nombre - SIMPLE: últimas 1-3 palabras del mensaje
+        # Eliminar palabras comunes primero
+        palabras_ignorar = ['busca', 'buscar', 'el', 'la', 'los', 'las', 'paciente', 'pacientes', 'con', 'nombre', 'apellido', 'de', 'del', 'llamado', 'llamada']
 
-        nombre = None
-        for i, pattern in enumerate(name_patterns):
-            name_match = re.search(pattern, message, re.IGNORECASE)
-            if name_match:
-                nombre = name_match.group(1).strip()
-                nombre = ' '.join(word.capitalize() for word in nombre.split())
-                logger.info(f"👤 NOMBRE encontrado con patrón {i}: '{nombre}'")
-                break
+        # Limpiar mensaje
+        palabras = message.lower().split()
+        palabras_filtradas = [p for p in palabras if p not in palabras_ignorar and len(p) > 2]
+
+        # Tomar las últimas 1-3 palabras (el nombre/apellido)
+        if palabras_filtradas:
+            nombre = ' '.join(palabras_filtradas[-3:])  # Últimas 3 palabras máximo
+            nombre = nombre.capitalize()
+            logger.info(f"👤 NOMBRE extraído: '{nombre}'")
+        else:
+            nombre = None
+            logger.info(f"❌ NO se pudo extraer nombre")
 
         if not nombre:
             logger.info(f"❌ NO se encontró nombre")
@@ -687,6 +972,7 @@ class ChatbotService:
 
     def _extract_date_range(self, message_lower: str) -> tuple:
         """Extraer rango de fechas del mensaje"""
+        from datetime import date, timedelta
         import re
 
         # Patrones para rangos de fechas
@@ -928,16 +1214,19 @@ class ChatbotService:
                 return None
 
             elif query_type == 'busqueda_paciente_nombre':
-                # Usar hospital_data_service para búsqueda por nombre
+                # Búsqueda MÚLTIPLE de pacientes por nombre (hasta 5 resultados)
                 nombre = query_info.get('nombre')
                 if nombre:
-                    result = await hospital_data_service.buscar_paciente_por_nombre(nombre)
-                    if result:
-                        logger.info(f"👤 Paciente encontrado por nombre: {nombre}")
+                    # Usar ORM service que devuelve múltiples resultados
+                    response = await orm_hospital_service.buscar_pacientes_por_nombre(nombre, limit=5)
+                    if response.success and response.data:
+                        pacientes = response.data
+                        logger.info(f"👥 {len(pacientes)} pacientes encontrados con nombre: {nombre}")
                         return {
-                            'type': 'patient_found_by_name',
-                            'patient': result,
-                            'nombre': nombre
+                            'type': 'patients_found_by_name',
+                            'pacientes': pacientes,
+                            'nombre': nombre,
+                            'total': len(pacientes)
                         }
                 return None
 
@@ -999,7 +1288,8 @@ class ChatbotService:
         user_message: str,
         query_info: Dict,
         real_data: Dict,
-        first_name: str
+        first_name: str,
+        conversation_id: str = None
     ) -> str:
         """Generar respuesta usando datos reales del hospital"""
 
@@ -1047,7 +1337,7 @@ class ChatbotService:
             )
         elif query_type == 'horarios_atencion':
             return await self._format_horarios_response(
-                user_message, query_info, real_data, first_name
+                user_message, query_info, real_data, first_name, conversation_id
             )
 
         return f"Hola {first_name}, encontré información pero necesito más detalles para ayudarte mejor."
@@ -1357,68 +1647,59 @@ Hola {first_name}, {real_data.get('message')}
     async def _format_patient_search_by_name_response(
         self, user_message: str, query_info: Dict, real_data: Dict, first_name: str
     ) -> str:
-        """Formatear respuesta de búsqueda de paciente por nombre"""
+        """Formatear respuesta de búsqueda MÚLTIPLE de pacientes por nombre"""
 
-        if real_data and real_data.get('type') == 'patient_found_by_name':
-            patient_data = real_data['patient']
-            nombre_buscado = real_data['nombre']
+        if real_data and real_data.get('type') == 'patients_found_by_name':
+            pacientes = real_data.get('pacientes', [])
+            nombre_buscado = real_data.get('nombre', '')
+            total = len(pacientes)
 
-            response = f"""🔍 **PACIENTE ENCONTRADO POR NOMBRE**
+            if total == 0:
+                return f"""🔍 **BÚSQUEDA DE PACIENTES**
+
+❌ No se encontraron pacientes con "{nombre_buscado}".
+
+**Sugerencias:**
+• Verificar la ortografía
+• Probar con apellido solamente
+• Contactar admisión: **4212121**"""
+
+            response = f"""🔍 **PACIENTES ENCONTRADOS**
 
 👤 **Búsqueda:** {nombre_buscado}
+📊 **Resultados:** {total} {'paciente' if total == 1 else 'pacientes'}
 
-📋 **Datos del Paciente:**
-• **Nombre Completo:** {patient_data.get('nombre_completo', 'No disponible')}
-• **DNI:** {patient_data.get('documento', 'No disponible')}
-• **Fecha de Nacimiento:** {patient_data.get('fecha_nacimiento', 'No disponible')}
-• **Edad:** {patient_data.get('edad', 'No especificada')} años
-• **Teléfono:** {patient_data.get('telefono') or 'No registrado'}
-• **Email:** {patient_data.get('email') or 'No disponible'}
-• **Obra Social:** {patient_data.get('obra_social', 'No especificada')}
+---
+"""
 
-🏥 **Estado de Internación:**"""
-
-            # Información de internación (SIEMPRE mostrar para directivos)
-            internacion_vigente = patient_data.get('internacion_vigente')
-            if internacion_vigente and internacion_vigente.get('internado'):
-                int_data = internacion_vigente
+            for i, p in enumerate(pacientes, 1):
                 response += f"""
-• **Estado:** INTERNADO
-• **Cama:** {self._clean_text(str(int_data.get('cama', '')))}
-• **Habitación:** {self._clean_text(str(int_data.get('habitacion', '')))}
-• **Sector:** {self._clean_text(str(int_data.get('sector', '')))}
-• **Médico Responsable:** {self._clean_text(str(int_data.get('medico_responsable', '')))}
-• **Fecha de Ingreso:** {int_data.get('fecha_ingreso', 'No disponible')}
-• **Días Internado:** {int_data.get('dias_internado', 'No calculado')}"""
-            else:
-                response += f"""
-• **Estado:** AMBULATORIO (no internado)
-• **Cama:** No asignada
-• **Sector:** No aplicable
-• **Médico Responsable:** Consulta externa"""
+**{i}. {p.get('nombre_completo', 'Sin nombre')}**
+• DNI: {p.get('documento', 'No disponible')}
+• Edad: {p.get('edad', 'N/A')} años
+• Teléfono: {p.get('telefono') or 'No registrado'}
+"""
 
             response += f"""
+---
 
-✅ **Búsqueda exitosa:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
-🏥 **Hospital Regional Santiago del Estero**
-📞 **Consultas:** 4212121"""
+💡 **Para ver más detalles de un paciente**, especificar por DNI
+📋 **Para ver más resultados**, preguntar: "mostrar más pacientes con {nombre_buscado}"
+
+✅ {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"""
 
             return response
         else:
             nombre_buscado = query_info.get('nombre', 'el nombre solicitado')
-            return f"""🔍 **BÚSQUEDA DE PACIENTE POR NOMBRE**
+            return f"""🔍 **BÚSQUEDA DE PACIENTES**
 
-❌ No se encontró paciente con el nombre "{nombre_buscado}" en nuestro sistema.
+❌ No se encontraron pacientes con "{nombre_buscado}".
 
 **Sugerencias:**
-• Verificar la ortografía del nombre completo
-• Probar con nombre y apellido
-• Confirmar que el paciente esté registrado
-• Contactar admisión: **4212121**
-
-**Alternativas de búsqueda:**
+• Verificar la ortografía
+• Probar con apellido solamente
 • Búsqueda por DNI (más precisa)
-• Consulta en recepción del hospital
+• Contactar admisión: **4212121**
 
 ¿Puedo ayudarte con otra consulta, {first_name}?"""
 
@@ -1644,11 +1925,98 @@ No pude encontrar información de volumen para {servicio}.
 
         return response
 
+    async def _generate_natural_response_with_ai(
+        self, user_message: str, query_type: str, real_data: Dict, first_name: str, conversation_history: List = None
+    ) -> str:
+        """
+        Generar respuesta natural y variada usando IA
+        Evita respuestas roboticas y repetitivas
+        Considera el contexto de la conversación
+        """
+        logger.info(f"🤖 Intentando generar respuesta natural con IA para: {query_type}")
+        try:
+            # Crear contexto con los datos reales (formato más simple para evitar problemas con template)
+            data_str = str(real_data)  # Convertir a string simple
+
+            # Crear contexto de conversación
+            history_context = ""
+            if conversation_history and len(conversation_history) > 0:
+                recent_messages = conversation_history[-3:]  # Últimos 3 mensajes
+                history_context = "\n\nContexto de conversación reciente:\n"
+                for msg in recent_messages:
+                    role = msg.get('role', 'user')
+                    content = msg.get('content', '')
+                    history_context += f"{role}: {content}\n"
+
+            # Construir el mensaje del sistema SIN f-strings para evitar conflictos con llaves
+            system_message = """Eres un asistente del Hospital Regional Santiago del Estero para personal de gestión.
+
+CONTEXTO IMPORTANTE:
+- El usuario """ + first_name + """ es un TRABAJADOR del hospital (personal médico/administrativo/gestión), NO un paciente
+- Trátalo como colega, no como paciente
+- SOLO responde consultas relacionadas con el hospital y su gestión
+- NO respondas preguntas personales o fuera del ámbito hospitalario
+
+ESTILO DE RESPUESTA:
+- NO uses siempre el mismo formato
+- Varía el estilo según el contexto y el historial
+- Usa lenguaje natural, no templates rígidos
+- Menciona solo la información relevante
+- Sé conciso pero completo
+- Usa emojis ocasionalmente, no en exceso
+- Si el usuario ya preguntó algo relacionado, referencia ese contexto
+- Adapta tu tono según la pregunta (formal/informal)
+
+Tipo de consulta: """ + query_type + history_context + """
+
+Datos reales de la base de datos:
+""" + data_str + """
+
+Genera una respuesta conversacional basada en estos datos REALES y el contexto de la conversación."""
+
+            response_prompt = ChatPromptTemplate.from_messages([
+                ("system", system_message),
+                ("user", "{message}")
+            ])
+
+            llm = ChatGroq(
+                model="llama-3.3-70b-versatile",
+                temperature=0.7,  # Más creatividad
+                groq_api_key=self.groq_api_key
+            )
+
+            chain = response_prompt | llm
+            response = await chain.ainvoke({"message": user_message})
+
+            logger.info(f"✅ Respuesta IA generada exitosamente")
+            return response.content.strip()
+
+        except Exception as e:
+            logger.warning(f"⚠️ Error generando respuesta con IA: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback a respuesta template
+            return None
+
     async def _format_horarios_response(
-        self, user_message: str, query_info: Dict, real_data: Dict, first_name: str
+        self, user_message: str, query_info: Dict, real_data: Dict, first_name: str, conversation_id: str = None
     ) -> str:
         """Formatear respuesta de horarios de atención"""
 
+        # Obtener historial de conversación si existe
+        conversation_history = []
+        if conversation_id:
+            history = self._get_conversation_history(conversation_id)
+            conversation_history = history[-5:]  # Últimos 5 mensajes
+
+        # Intentar generar respuesta natural con IA primero
+        ai_response = await self._generate_natural_response_with_ai(
+            user_message, 'horarios_atencion', real_data, first_name, conversation_history
+        )
+        if ai_response:
+            return ai_response
+
+        # Fallback a template si la IA falla
         medico = query_info.get('medico')
         servicio = query_info.get('servicio', 'el servicio consultado')
 
@@ -1696,12 +2064,19 @@ Hola {first_name}, no pude obtener los horarios de {servicio or "el servicio con
         if horarios:
             for horario in horarios:
                 dia = horario.get('dia', 'Día no especificado')
-                hora_inicio = horario.get('hora_inicio', 'No disponible')
-                hora_fin = horario.get('hora_fin', 'No disponible')
                 cantidad = horario.get('cantidad_turnos', 0)
+                manana = horario.get('manana')
+                tarde = horario.get('tarde')
 
-                response += f"""
-• **{dia}:** {hora_inicio} - {hora_fin} ({cantidad} turnos)"""
+                response += f"\n• **{dia}:** ({cantidad} turnos)"
+
+                if manana:
+                    response += f"\n  - Mañana: {manana}"
+                if tarde:
+                    response += f"\n  - Tarde: {tarde}"
+
+                if not manana and not tarde:
+                    response += "\n  - Horarios no disponibles"
         else:
             response += "\n• Horarios no disponibles"
 
