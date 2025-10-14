@@ -1091,6 +1091,12 @@ MENSAJE ACTUAL DEL USUARIO:
                 'can_view_detailed_evolution': True,
                 'can_view_medications': True
             },
+            'coordinadora_gestion': {
+                'can_view_basic_data': True,
+                'can_view_clinical_history': True,
+                'can_view_detailed_evolution': True,
+                'can_view_medications': True
+            },
             'medico': {
                 'can_view_basic_data': True,
                 'can_view_clinical_history': True,

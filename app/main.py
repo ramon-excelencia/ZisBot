@@ -289,6 +289,7 @@ async def login_with_institution(request: LoginWithInstitutionRequest) -> JSONRe
         token = create_jwt_token(user_data)
 
         logger.info(f"Login exitoso: {user_data['user_name']} - {selected_institution['name']}")
+        logger.info(f"🔑 JWT creado con rol: {user_data.get('role', 'NO DEFINIDO')}")
 
         # Respuesta compatible con frontend
         user_response = {
@@ -346,6 +347,7 @@ async def chat_endpoint(
 
         logger.info(f"🔍 CHAT: Consulta de {user_data['user_name']}: {request.message[:100]}...")
         logger.info(f"🔍 CHAT: Session ID: {user_context.get('session_id', 'N/A')}")
+        logger.info(f"🔍 CHAT: Rol recibido desde JWT: {user_data.get('role', 'NO ENCONTRADO')}")
 
         # 🔹 SERVICIO UNIFICADO SIN FALLBACK (COMO FUNCIONABA ANTES)
         logger.info("🔍 CHAT: Usando servicio unificado de chatbot...")

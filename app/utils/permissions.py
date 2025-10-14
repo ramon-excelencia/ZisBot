@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 class Role(str, Enum):
     """Roles disponibles en el sistema"""
+    ADMIN = "admin"
     DIRECTIVO = "directivo"
     COORDINADORA_GESTION = "coordinadora_gestion"
     MEDICO = "medico"
